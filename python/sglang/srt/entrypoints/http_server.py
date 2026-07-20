@@ -571,10 +571,20 @@ async def validation_exception_handler(request: Request, exc: HTTPException):
     error = ErrorResponse(
         object="error",
         message=exc.detail,
-        type=str(exc.status_code),
+        type=(
+            "rate_limit_error"
+            if exc.status_code == HTTPStatus.TOO_MANY_REQUESTS
+            else str(exc.status_code)
+        ),
         code=exc.status_code,
     )
-    return ORJSONResponse(content=error.model_dump(), status_code=exc.status_code)
+    # This handler replaces FastAPI's default, so headers set on the exception
+    # (e.g. Retry-After on a 429) are only propagated if we forward them here.
+    return ORJSONResponse(
+        content=error.model_dump(),
+        status_code=exc.status_code,
+        headers=exc.headers,
+    )
 
 
 # Custom exception handlers to change validation error status codes

@@ -2686,6 +2686,7 @@ class Scheduler(
         # Reject the incoming request by default.
         req_to_abort = recv_req
         message = "The request queue is full."
+        reason = "queue_full"
         if self.enable_priority_scheduling:
             # With priority scheduling, consider aboritng an existing request based on the priority.
             # direction = 1  => smaller number = higher priority; -1 => larger number = higher priority.
@@ -2709,12 +2710,13 @@ class Scheduler(
                 self.waiting_queue.pop(idx)
                 req_to_abort = candidate_req
                 message = "The request is aborted by a higher priority request."
+                reason = "higher_priority"
 
         self.ipc_channels.send_to_tokenizer.send_output(
             AbortReq(
                 finished_reason={
                     "type": "abort",
-                    "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
+                    "status_code": HTTPStatus.TOO_MANY_REQUESTS,
                     "message": message,
                 },
                 rid=req_to_abort.rid,
@@ -2722,6 +2724,8 @@ class Scheduler(
             req_to_abort,
         )
         req_to_abort.time_stats.trace_ctx.abort(abort_info={"reason": message})
+        if self.metrics_collector:
+            self.metrics_collector.increment_rejected_requests(reason=reason)
         return req_to_abort.rid == recv_req.rid
 
     def _abort_on_waiting_timeout(self):

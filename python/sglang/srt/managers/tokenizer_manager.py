@@ -1639,6 +1639,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if finish_reason.get("type") == "abort" and finish_reason.get(
             "status_code"
         ) in (
+            HTTPStatus.TOO_MANY_REQUESTS,
             HTTPStatus.SERVICE_UNAVAILABLE,
             HTTPStatus.INTERNAL_SERVER_ERROR,
         ):
@@ -1651,9 +1652,18 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             if self.enable_lora and state.obj.lora_path:
                 await self.lora_registry.release(state.obj.lora_id)
             if not is_stream:
+                # Retry-After: 0 tells clients to retry immediately (or route
+                # elsewhere) rather than back off -- a queue-full reject is
+                # transient and another replica may be idle right now.
+                headers = (
+                    {"Retry-After": "0"}
+                    if finish_reason["status_code"] == HTTPStatus.TOO_MANY_REQUESTS
+                    else None
+                )
                 raise fastapi.HTTPException(
                     status_code=finish_reason["status_code"],
                     detail=finish_reason["message"],
+                    headers=headers,
                 )
             return out
 
