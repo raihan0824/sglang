@@ -2048,6 +2048,43 @@ async def send_concurrent_generate_requests(
     return await asyncio.gather(*tasks)
 
 
+async def send_concurrent_generate_requests_detailed(
+    base_url: str, num_requests: int
+) -> List[Tuple[int, dict, Any]]:
+    """Like send_concurrent_generate_requests, but returns (status, headers, body).
+
+    Needed to assert on rejection semantics (e.g. a 429 carrying Retry-After and an
+    OpenAI-shaped error body) rather than just the status code.
+    """
+
+    async def async_generate():
+        async with aiohttp.ClientSession() as session:
+            prompt = """
+            System: You are a helpful assistant.
+            User: What is the capital of France?
+            Assistant: The capital of France is
+            """
+            async with session.post(
+                f"{base_url}/generate",
+                json={
+                    "text": prompt,
+                    "sampling_params": {
+                        "temperature": 0,
+                        "max_new_tokens": 500,
+                    },
+                },
+            ) as response:
+                headers = dict(response.headers)
+                try:
+                    body = await response.json(content_type=None)
+                except Exception:
+                    body = await response.text()
+                return (response.status, headers, body)
+
+    tasks = [asyncio.create_task(async_generate()) for _ in range(num_requests)]
+    return await asyncio.gather(*tasks)
+
+
 async def send_concurrent_generate_requests_with_custom_params(
     base_url: str,
     custom_params: List[dict[str, Any]],

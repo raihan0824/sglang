@@ -46,7 +46,10 @@ from sglang.srt.entrypoints.openai.protocol import (
     ToolChoice,
     TopLogprob,
 )
-from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
+from sglang.srt.entrypoints.openai.serving_base import (
+    OpenAIServingBase,
+    RequestAbortedError,
+)
 from sglang.srt.entrypoints.openai.sse_utils import build_sse_content
 from sglang.srt.entrypoints.openai.usage_processor import UsageProcessor
 from sglang.srt.entrypoints.openai.utils import (
@@ -1007,6 +1010,13 @@ class OpenAIServingChat(OpenAIServingBase):
             first_chunk = await generator.__anext__()
         except ValueError as e:
             return self.create_error_response(str(e))
+        except RequestAbortedError as e:
+            return self.create_error_response(
+                e.message,
+                err_type="rate_limit_error",
+                status_code=e.status_code.value,
+                headers={"Retry-After": "0"},
+            )
 
         async def prepend_first_chunk():
             yield first_chunk
@@ -1106,8 +1116,15 @@ class OpenAIServingChat(OpenAIServingBase):
                         finish_reason.get("status_code"), HTTPStatus
                     ):
                         code = finish_reason["status_code"]
+                        msg = finish_reason.get("message", "Generation aborted.")
+                        # Nothing has streamed yet, so HTTP 200 has not been
+                        # committed -- raise so the caller can return a real 429
+                        # instead of an in-band SSE frame. Mid-stream aborts must
+                        # still use the frame; the status is already sent.
+                        if not stream_started and code == HTTPStatus.TOO_MANY_REQUESTS:
+                            raise RequestAbortedError(code, msg)
                         error = self.create_streaming_error_response(
-                            finish_reason.get("message", "Generation aborted."),
+                            msg,
                             code.name,
                             code.value,
                         )

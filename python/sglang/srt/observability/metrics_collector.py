@@ -451,6 +451,11 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             documentation="Total number of retracted requests.",
             labelnames=labels.keys(),
         )
+        self.num_requests_rejected_total = Counter(
+            name="sglang:num_requests_rejected_total",
+            documentation="Total number of rejected requests by reason.",
+            labelnames=list(labels.keys()) + ["reason"],
+        )
         self.num_retracted_input_tokens_total = Counter(
             name="sglang:num_retracted_input_tokens_total",
             documentation="Total number of retracted input tokens.",
@@ -1170,6 +1175,9 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             output_reason=output_reason,
             actual_execution=str(actual_execution).lower(),
         ).inc(1)
+
+    def increment_rejected_requests(self, reason: str) -> None:
+        self.num_requests_rejected_total.labels(**self.labels, reason=reason).inc(1)
 
     def increment_retracted_reqs(
         self,

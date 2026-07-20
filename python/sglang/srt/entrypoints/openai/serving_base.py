@@ -4,7 +4,8 @@ import json
 import logging
 import uuid
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
+from http import HTTPStatus
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 import orjson
 from fastapi import HTTPException, Request
@@ -20,6 +21,16 @@ if TYPE_CHECKING:
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
 
 logger = logging.getLogger(__name__)
+
+
+class RequestAbortedError(Exception):
+    """Abort carrying an explicit HTTP status, raised before any SSE bytes so the
+    streaming handler can return a real HTTP status instead of an in-band frame."""
+
+    def __init__(self, status_code: HTTPStatus, message: str):
+        self.status_code = status_code
+        self.message = message
+        super().__init__(message)
 
 
 # Base class for specific endpoint handlers
@@ -212,6 +223,7 @@ class OpenAIServingBase(ABC):
         err_type: str = "BadRequestError",
         status_code: int = 400,
         param: Optional[str] = None,
+        headers: Optional[Dict[str, str]] = None,
     ) -> ORJSONResponse:
         """Create an error response"""
         # TODO: remove fastapi dependency in openai and move response handling to the entrypoint
@@ -222,7 +234,9 @@ class OpenAIServingBase(ABC):
             param=param,
             code=status_code,
         )
-        return ORJSONResponse(content=error.model_dump(), status_code=status_code)
+        return ORJSONResponse(
+            content=error.model_dump(), status_code=status_code, headers=headers
+        )
 
     def create_streaming_error_response(
         self,
