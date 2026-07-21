@@ -49,6 +49,7 @@ from sglang.srt.speculative.draft_worker_common import (
     make_draft_sampler_capture_hook,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.layers.logprob_processor import compute_spec_v2_logprobs
 from sglang.srt.speculative.spec_utils import (
     SIMULATE_ACC_LEN,
     SIMULATE_ACC_METHOD,
@@ -1383,10 +1384,6 @@ class DFlashWorkerV2(BaseSpecWorker):
         on_publish=None,
         grammar_barrier=None,
     ) -> GenerationBatchResult:
-        if getattr(batch, "return_logprob", False):
-            raise ValueError(
-                "DFLASH speculative decoding does not support return_logprob yet."
-            )
         self._validate_phase1_sampling_support(batch)
 
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
@@ -1834,6 +1831,27 @@ class DFlashWorkerV2(BaseSpecWorker):
             # The Triton path may have written new_seq_lens from the real
             # accept_len; recompute it from the forced commit_lens.
             new_seq_lens = None
+
+        if batch.return_logprob and not batch.forward_mode.is_idle():
+            # DFLASH's linear block maps committed token m to verify node m
+            # (out_tokens[b, m] is the token node m predicted, bonus included),
+            # so accept_index is simply the first commit_lens node indices of
+            # each row, -1 padded (same contract as EAGLE/ngram). Width is
+            # block_size, hence the (block_size - 1) "steps" argument.
+            block = int(self.block_size)
+            node_offsets = torch.arange(block, device=device)
+            accept_index = (
+                torch.arange(bs, device=device, dtype=torch.int64)[:, None] * block
+                + node_offsets[None, :]
+            )
+            accept_index[node_offsets[None, :] >= commit_lens[:, None]] = -1
+            compute_spec_v2_logprobs(
+                batch,
+                logits_output,
+                out_tokens.reshape(-1),
+                accept_index,
+                block - 1,
+            )
 
         if self._need_mamba_verify_commit:
             assert seq_lens_pre_verify is not None
