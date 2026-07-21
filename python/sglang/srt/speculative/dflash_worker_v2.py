@@ -27,7 +27,10 @@ from sglang.srt.speculative.dflash_utils import (
     parse_dflash_draft_config,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
+from sglang.srt.speculative.spec_utils import (
+    assign_req_to_token_pool_func,
+    generate_token_bitmask,
+)
 from sglang.srt.speculative.triton_ops.cache_locs import assign_extend_cache_locs_func
 from sglang.srt.speculative.triton_ops.dflash import (
     _compute_dflash_accept_bonus_triton_unchecked,
@@ -1518,6 +1521,25 @@ class DFlashWorkerV2(BaseSpecWorker):
         # TARGET_VERIFY uses standard causal masking; custom masks are unnecessary here.
         custom_mask = None
 
+        # Grammar (structured output): snapshot the linear draft block to CPU
+        # before launching the verify forward, so the FSM walk overlaps the GPU
+        # pass (same overlap trick as ngram_worker). The block is a linear
+        # chain, i.e. a degenerate draft tree: next[i] = i + 1, no siblings --
+        # which lets us reuse the tree-walk bitmask machinery unchanged.
+        # draft_tokens[:, 0] is the anchor (previous bonus token, already
+        # committed to the FSM by the scheduler), matching the tree walker's
+        # always-accepted root.
+        grammar_draft_tokens_cpu = None
+        if batch.has_grammar:
+            block = int(self.block_size)
+            grammar_draft_tokens_cpu = draft_tokens.cpu()
+            linear_next = torch.arange(1, block + 1, dtype=torch.int64)
+            linear_next[-1] = -1
+            grammar_retrieve_next_token_cpu = linear_next.expand(bs, block)
+            grammar_retrieve_next_sibling_cpu = torch.full(
+                (bs, block), -1, dtype=torch.int64
+            )
+
         verify_input_ids = draft_tokens.reshape(-1)
         verify_input = DFlashVerifyInput(
             draft_token=verify_input_ids,
@@ -1569,6 +1591,29 @@ class DFlashWorkerV2(BaseSpecWorker):
                 sampling_info=sampling_info,
                 draft_token_num=int(self.block_size),
             )
+
+        if grammar_draft_tokens_cpu is not None:
+            # The CPU FSM walk above overlapped the verify forward; apply the
+            # resulting mask to the target logits so that both the accept
+            # comparison and the bonus token are grammar-constrained. Off-
+            # grammar draft tokens get -inf logits and are rejected naturally.
+            vocab_mask = generate_token_bitmask(
+                batch.reqs,
+                verify_input,
+                grammar_retrieve_next_token_cpu,
+                grammar_retrieve_next_sibling_cpu,
+                grammar_draft_tokens_cpu,
+                batch.sampling_info.vocab_size,
+            )
+            if vocab_mask is not None:
+                assert verify_input.grammar is not None
+                vocab_mask = vocab_mask.to(logits_output.next_token_logits.device)
+                # Clear any stale extend-stage mask so it cannot be re-applied
+                # to these verify logits (see the same guard in ngram_worker).
+                batch.sampling_info.vocab_mask = None
+                verify_input.grammar.apply_vocab_mask(
+                    logits=logits_output.next_token_logits, vocab_mask=vocab_mask
+                )
 
         candidates = draft_tokens
         new_seq_lens = None
