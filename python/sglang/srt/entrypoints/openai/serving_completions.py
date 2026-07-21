@@ -206,12 +206,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
         except ValueError as e:
             return self.create_error_response(str(e))
         except RequestAbortedError as e:
-            return self.create_error_response(
-                e.message,
-                err_type="rate_limit_error",
-                status_code=e.status_code.value,
-                headers={"Retry-After": "0"},
-            )
+            return self.create_abort_error_response(e)
 
         async def prepend_first_chunk():
             yield first_chunk
@@ -362,10 +357,12 @@ class OpenAIServingCompletion(OpenAIServingBase):
                     code = finish_reason["status_code"]
                     msg = finish_reason.get("message", "Generation aborted.")
                     # Nothing has streamed yet, so HTTP 200 has not been committed
-                    # -- raise so the caller can return a real 429 instead of an
-                    # in-band SSE frame. Mid-stream aborts must still use the
-                    # frame; the status is already sent.
-                    if not stream_started and code == HTTPStatus.TOO_MANY_REQUESTS:
+                    # -- raise so the caller can return the real HTTP status (429
+                    # queue-full, 400 scheduler rejects, 503 waiting timeout)
+                    # instead of an in-band SSE frame that OpenAI-dialect proxies
+                    # misread as a provider failure. Mid-stream aborts must still
+                    # use the frame; the status is already sent.
+                    if not stream_started:
                         raise RequestAbortedError(code, msg)
                     error = self.create_streaming_error_response(
                         msg,

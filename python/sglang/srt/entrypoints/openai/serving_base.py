@@ -238,6 +238,27 @@ class OpenAIServingBase(ABC):
             content=error.model_dump(), status_code=status_code, headers=headers
         )
 
+    def create_abort_error_response(self, e: RequestAbortedError) -> ORJSONResponse:
+        """Map a pre-stream abort to a real HTTP error response.
+
+        Mirrors the non-streaming path for the same scheduler aborts: 429 keeps
+        rate-limit semantics (Retry-After: 0 = retry now / route elsewhere), 400
+        matches the ValueError path's "BadRequest" type, everything else carries
+        its HTTPStatus name.
+        """
+        if e.status_code == HTTPStatus.TOO_MANY_REQUESTS:
+            err_type, headers = "rate_limit_error", {"Retry-After": "0"}
+        elif e.status_code == HTTPStatus.BAD_REQUEST:
+            err_type, headers = "BadRequest", None
+        else:
+            err_type, headers = e.status_code.name, None
+        return self.create_error_response(
+            e.message,
+            err_type=err_type,
+            status_code=e.status_code.value,
+            headers=headers,
+        )
+
     def create_streaming_error_response(
         self,
         message: str,
@@ -252,7 +273,18 @@ class OpenAIServingBase(ABC):
             param=None,
             code=status_code,
         )
-        return json.dumps({"error": error.model_dump()})
+        # "id" and "choices" let OpenAI-dialect stream parsers (e.g. LiteLLM's,
+        # which does chunk["id"] unconditionally) pass this frame through as a
+        # parseable chunk instead of raising KeyError and severing the stream;
+        # the nested "error" object stays the error-detection contract.
+        return json.dumps(
+            {
+                "id": f"error-{uuid.uuid4().hex}",
+                "object": "chat.completion.chunk",
+                "choices": [],
+                "error": error.model_dump(),
+            }
+        )
 
     def extract_custom_labels(self, raw_request):
         if (
