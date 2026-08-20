@@ -256,42 +256,57 @@ impl PolicyRegistry {
 
     /// Get all PowerOfTwo policies that need load updates (lock-free)
     pub fn get_all_power_of_two_policies(&self) -> Vec<Arc<dyn LoadBalancingPolicy>> {
-        let mut power_of_two_policies = Vec::new();
+        self.collect_policies(|p| p.name() == "power_of_two")
+    }
 
-        if self.default_policy.name() == "power_of_two" {
-            power_of_two_policies.push(Arc::clone(&self.default_policy));
-        }
+    /// Get every registered policy that wants periodic worker load updates.
+    ///
+    /// Generalizes the former PowerOfTwo-only lookup: policies opt in via
+    /// `LoadBalancingPolicy::needs_load_updates` rather than by name, so a new
+    /// load-driven policy does not have to be added to a string allowlist here.
+    pub fn get_all_load_updating_policies(&self) -> Vec<Arc<dyn LoadBalancingPolicy>> {
+        self.collect_policies(|p| p.needs_load_updates())
+    }
 
-        // Get prefill and decode policies (lock-free via OnceLock::get)
-        let prefill_policy_opt = self.prefill_policy.get();
-        let decode_policy_opt = self.decode_policy.get();
+    /// The shortest load poll interval requested by any registered policy.
+    pub fn min_load_check_interval_secs(&self) -> Option<u64> {
+        self.get_all_load_updating_policies()
+            .iter()
+            .filter_map(|p| p.load_check_interval_secs())
+            .filter(|s| *s > 0)
+            .min()
+    }
 
-        if let Some(policy) = prefill_policy_opt {
-            if policy.name() == "power_of_two" && !Arc::ptr_eq(policy, &self.default_policy) {
-                power_of_two_policies.push(Arc::clone(policy));
+    /// Collect the distinct policies (default, prefill, decode, per-model) matching
+    /// `predicate`, deduplicated by pointer identity.
+    fn collect_policies<F>(&self, predicate: F) -> Vec<Arc<dyn LoadBalancingPolicy>>
+    where
+        F: Fn(&Arc<dyn LoadBalancingPolicy>) -> bool,
+    {
+        let mut selected: Vec<Arc<dyn LoadBalancingPolicy>> = Vec::new();
+
+        let push_unique = |policy: &Arc<dyn LoadBalancingPolicy>,
+                               selected: &mut Vec<Arc<dyn LoadBalancingPolicy>>| {
+            if predicate(policy) && !selected.iter().any(|p| Arc::ptr_eq(p, policy)) {
+                selected.push(Arc::clone(policy));
             }
-        }
+        };
 
-        if let Some(policy) = decode_policy_opt {
-            if policy.name() == "power_of_two"
-                && !Arc::ptr_eq(policy, &self.default_policy)
-                && !prefill_policy_opt.is_some_and(|p| Arc::ptr_eq(p, policy))
-            {
-                power_of_two_policies.push(Arc::clone(policy));
-            }
+        push_unique(&self.default_policy, &mut selected);
+
+        // Prefill and decode policies (lock-free via OnceLock::get)
+        if let Some(policy) = self.prefill_policy.get() {
+            push_unique(policy, &mut selected);
+        }
+        if let Some(policy) = self.decode_policy.get() {
+            push_unique(policy, &mut selected);
         }
 
         for entry in self.model_policies.iter() {
-            let policy = entry.value();
-            if policy.name() == "power_of_two" {
-                let already_added = power_of_two_policies.iter().any(|p| Arc::ptr_eq(p, policy));
-                if !already_added {
-                    power_of_two_policies.push(Arc::clone(policy));
-                }
-            }
+            push_unique(entry.value(), &mut selected);
         }
 
-        power_of_two_policies
+        selected
     }
 
     /// Initialize cache-aware policy with workers if applicable

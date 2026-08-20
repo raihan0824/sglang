@@ -19,7 +19,7 @@ use tracing::{debug, info, warn};
 
 use crate::{
     core::{metrics_aggregator::MetricPack, ConnectionMode, Worker, WorkerRegistry, WorkerType},
-    policies::PolicyRegistry,
+    policies::{PolicyRegistry, PrefillLoadReport},
     protocols::worker_spec::{FlushCacheResult, WorkerLoadInfo, WorkerLoadsResult},
 };
 
@@ -229,6 +229,87 @@ impl WorkerManager {
         }
     }
 
+    /// Fetch the per-worker prefill load snapshot used by chunk_aware.
+    ///
+    /// Reads the same `/v1/loads?include=core` document as `parse_load_response`,
+    /// but keeps the fields that describe *queued prefill work* rather than the
+    /// single aggregate token count.
+    pub async fn get_all_prefill_loads(
+        worker_registry: &WorkerRegistry,
+        client: &reqwest::Client,
+    ) -> HashMap<String, PrefillLoadReport> {
+        let workers = worker_registry.get_all();
+
+        let futures: Vec<_> = workers
+            .iter()
+            .filter(|w| matches!(w.connection_mode(), ConnectionMode::Http))
+            .map(|worker| {
+                let url = worker.url().to_string();
+                let api_key = worker.api_key().clone();
+                let client = client.clone();
+
+                async move {
+                    let report =
+                        Self::parse_prefill_load_response(&client, &url, api_key.as_deref()).await;
+                    report.map(|r| (url, r))
+                }
+            })
+            .collect();
+
+        future::join_all(futures)
+            .await
+            .into_iter()
+            .flatten()
+            .collect()
+    }
+
+    async fn parse_prefill_load_response(
+        client: &reqwest::Client,
+        url: &str,
+        api_key: Option<&str>,
+    ) -> Option<PrefillLoadReport> {
+        let load_url = format!("{}/v1/loads?include=core", url);
+        let mut req = client.get(&load_url).timeout(REQUEST_TIMEOUT);
+        if let Some(key) = api_key {
+            req = req.bearer_auth(key);
+        }
+
+        let response = req.send().await.ok()?;
+        if !response.status().is_success() {
+            return None;
+        }
+        let json = response.json::<Value>().await.ok()?;
+
+        // The document holds one entry per DP rank under "loads"; sum across
+        // ranks so a DP-sharded worker is comparable to a plain one.
+        let entries: Vec<&Value> = match json.get("loads").and_then(|l| l.as_array()) {
+            Some(array) => array.iter().collect(),
+            None => vec![&json],
+        };
+        if entries.is_empty() {
+            return None;
+        }
+
+        let sum = |key: &str| -> Option<i64> {
+            let mut total: Option<i64> = None;
+            for entry in &entries {
+                if let Some(v) = entry.get(key).and_then(|v| v.as_i64()) {
+                    total = Some(total.unwrap_or(0) + v);
+                }
+            }
+            total
+        };
+
+        Some(PrefillLoadReport {
+            waiting_uncached_tokens: sum("num_waiting_uncached_tokens").unwrap_or(0),
+            running_reqs: sum("num_running_reqs").unwrap_or(0),
+            // Present only on sglang >= 0.5.16; None keeps chunk_aware in
+            // fixed-chunk proxy mode instead of measured-rate mode.
+            total_prefill_uncached_tokens: sum("total_prefill_uncached_tokens"),
+            total_prefill_busy_us: sum("total_prefill_busy_us"),
+        })
+    }
+
     pub async fn get_engine_metrics(
         worker_registry: &WorkerRegistry,
         client: &reqwest::Client,
@@ -347,11 +428,32 @@ impl LoadMonitor {
         loop {
             interval_timer.tick().await;
 
-            let power_of_two_policies = policy_registry.get_all_power_of_two_policies();
+            let load_policies = policy_registry.get_all_load_updating_policies();
 
-            if power_of_two_policies.is_empty() {
-                debug!("No PowerOfTwo policies found, skipping load fetch");
+            if load_policies.is_empty() {
+                debug!("No load-aware policies found, skipping load fetch");
                 continue;
+            }
+
+            // Policies wanting the detailed prefill snapshot (chunk_aware) get a
+            // second, richer document; the scalar path stays as-is for
+            // power_of_two so its semantics do not shift.
+            let wants_prefill_detail = load_policies
+                .iter()
+                .any(|p| p.name() == "chunk_aware");
+
+            if wants_prefill_detail {
+                let reports =
+                    WorkerManager::get_all_prefill_loads(&worker_registry, &client).await;
+                if reports.is_empty() {
+                    warn!("No prefill loads fetched from workers");
+                } else {
+                    debug!("Fetched prefill loads from {} workers", reports.len());
+                    let all_workers = worker_registry.get_all();
+                    for policy in &load_policies {
+                        policy.update_prefill_loads(&all_workers, &reports);
+                    }
+                }
             }
 
             let result = WorkerManager::get_all_worker_loads(&worker_registry, &client).await;
@@ -363,11 +465,11 @@ impl LoadMonitor {
 
             if !loads.is_empty() {
                 debug!(
-                    "Fetched loads from {} workers, updating {} PowerOfTwo policies",
+                    "Fetched loads from {} workers, updating {} load-aware policies",
                     loads.len(),
-                    power_of_two_policies.len()
+                    load_policies.len()
                 );
-                for policy in &power_of_two_policies {
+                for policy in &load_policies {
                     policy.update_loads(&loads);
                 }
                 let _ = tx.send(loads);

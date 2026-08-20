@@ -628,6 +628,17 @@ impl Tree {
 
     #[allow(dead_code)]
     pub fn prefix_match_tenant(&self, text: &str, tenant: &str) -> String {
+        take_chars(text, self.prefix_match_tenant_count(text, tenant))
+    }
+
+    /// Number of characters of `text` matched along the radix path owned by `tenant`.
+    ///
+    /// Count-only variant of `prefix_match_tenant`: it skips the `take_chars`
+    /// result allocation, which matters for callers that score every candidate
+    /// worker on every request (chunk_aware) rather than a single tenant.
+    /// Like `prefix_match_tenant`, this refreshes the matched node's LRU
+    /// timestamp for `tenant`.
+    pub fn prefix_match_tenant_count(&self, text: &str, tenant: &str) -> usize {
         // Use slice-based traversal - no Vec<char> allocation
 
         // Intern tenant ID once for efficient lookups
@@ -688,8 +699,7 @@ impl Tree {
                 .insert(Arc::clone(&tenant_id), epoch);
         }
 
-        // Build result from original input using char count
-        take_chars(text, matched_chars)
+        matched_chars
     }
 
     /// Return the list of tenants for which this node is a leaf.

@@ -130,13 +130,17 @@ impl Router {
         }
     }
 
-    /// Select worker for a specific model considering circuit breaker state
+    /// Select worker for a specific model considering circuit breaker state.
+    ///
+    /// Returns the worker plus any prefill work the policy reserved for this
+    /// request, which the caller must hand to `WorkerLoadGuard` so the
+    /// reservation is released on the same path as the load counter.
     async fn select_worker_for_model(
         &self,
         model_id: Option<&str>,
         text: Option<&str>,
         headers: Option<&HeaderMap>,
-    ) -> Option<Arc<dyn Worker>> {
+    ) -> Option<(Arc<dyn Worker>, i64)> {
         let effective_model_id = if !self.enable_igw { None } else { model_id };
 
         // Get workers for the specified model O(1), filtered by connection mode
@@ -168,8 +172,8 @@ impl Router {
             .worker_registry
             .get_hash_ring(effective_model_id.unwrap_or(UNKNOWN_MODEL_ID));
 
-        let idx = policy
-            .select_worker(
+        let selection = policy
+            .select_worker_detailed(
                 &available,
                 &SelectWorkerInfo {
                     request_text: text,
@@ -188,7 +192,10 @@ impl Router {
             policy.name(),
         );
 
-        Some(available[idx].clone())
+        Some((
+            available[selection.index].clone(),
+            selection.reserved_prefill_tokens,
+        ))
     }
 
     pub async fn route_typed_request<T: GenerationRequest + serde::Serialize + Clone>(
@@ -279,11 +286,11 @@ impl Router {
         is_stream: bool,
         text: &str,
     ) -> Response {
-        let worker = match self
+        let (worker, reserved_prefill_tokens) = match self
             .select_worker_for_model(model_id, Some(text), headers)
             .await
         {
-            Some(w) => w,
+            Some(selected) => selected,
             None => {
                 return error::service_unavailable(
                     "no_available_workers",
@@ -297,9 +304,19 @@ impl Router {
             None => self.policy_registry.get_default_policy(),
         };
 
-        let load_guard = ["cache_aware", "manual"]
+        // These policies read `worker.load()` when scoring, so the router must
+        // maintain that counter for them; policies that score purely on polled
+        // load do not pay for the guard. chunk_aware additionally carries a
+        // prefill reservation released by the same guard.
+        let load_guard = ["cache_aware", "manual", "chunk_aware"]
             .contains(&policy.name())
-            .then(|| WorkerLoadGuard::new(worker.clone(), headers));
+            .then(|| {
+                WorkerLoadGuard::with_prefill_reservation(
+                    worker.clone(),
+                    headers,
+                    reserved_prefill_tokens,
+                )
+            });
 
         // Note: Using borrowed reference avoids heap allocation
         events::RequestSentEvent { url: worker.url() }.emit();

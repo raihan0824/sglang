@@ -3,9 +3,9 @@
 use std::sync::Arc;
 
 use super::{
-    BucketConfig, BucketPolicy, CacheAwareConfig, CacheAwarePolicy, ConsistentHashingPolicy,
-    LoadBalancingPolicy, ManualConfig, ManualPolicy, PowerOfTwoPolicy, PrefixHashConfig,
-    PrefixHashPolicy, RandomPolicy, RoundRobinPolicy,
+    BucketConfig, BucketPolicy, CacheAwareConfig, CacheAwarePolicy, ChunkAwareConfig,
+    ChunkAwarePolicy, ConsistentHashingPolicy, LoadBalancingPolicy, ManualConfig, ManualPolicy,
+    PowerOfTwoPolicy, PrefixHashConfig, PrefixHashPolicy, RandomPolicy, RoundRobinPolicy,
 };
 use crate::config::PolicyConfig;
 
@@ -34,6 +34,34 @@ impl PolicyFactory {
                     max_tree_size: *max_tree_size,
                 };
                 Arc::new(CacheAwarePolicy::with_config(config))
+            }
+            PolicyConfig::ChunkAware {
+                chunk_size_tokens,
+                long_prefill_threshold_tokens,
+                load_weight,
+                prefill_work_weight,
+                prefix_affinity_credit,
+                min_cache_match_rate,
+                spillover_bound_chunks,
+                load_check_interval_secs,
+                chars_per_token,
+                eviction_interval_secs,
+                max_tree_size,
+            } => {
+                let config = ChunkAwareConfig {
+                    chunk_size_tokens: *chunk_size_tokens,
+                    long_prefill_threshold_tokens: *long_prefill_threshold_tokens,
+                    load_weight: *load_weight,
+                    prefill_work_weight: *prefill_work_weight,
+                    prefix_affinity_credit: *prefix_affinity_credit,
+                    min_cache_match_rate: *min_cache_match_rate,
+                    spillover_bound_chunks: *spillover_bound_chunks,
+                    load_check_interval_secs: *load_check_interval_secs,
+                    chars_per_token: *chars_per_token,
+                    eviction_interval_secs: *eviction_interval_secs,
+                    max_tree_size: *max_tree_size,
+                };
+                Arc::new(ChunkAwarePolicy::with_config(config))
             }
             PolicyConfig::Bucket {
                 balance_abs_threshold,
@@ -80,6 +108,7 @@ impl PolicyFactory {
             "round_robin" | "roundrobin" => Some(Arc::new(RoundRobinPolicy::new())),
             "power_of_two" | "poweroftwo" => Some(Arc::new(PowerOfTwoPolicy::new())),
             "cache_aware" | "cacheaware" => Some(Arc::new(CacheAwarePolicy::new())),
+            "chunk_aware" | "chunkaware" => Some(Arc::new(ChunkAwarePolicy::new())),
             "bucket" => Some(Arc::new(BucketPolicy::new())),
             "manual" => Some(Arc::new(ManualPolicy::new())),
             "consistent_hashing" | "consistenthashing" => {
@@ -117,6 +146,26 @@ mod tests {
         });
         assert_eq!(policy.name(), "cache_aware");
 
+        let policy = PolicyFactory::create_from_config(&PolicyConfig::ChunkAware {
+            chunk_size_tokens: 8192,
+            long_prefill_threshold_tokens: 8192,
+            load_weight: 1.5,
+            prefill_work_weight: 1.0,
+            prefix_affinity_credit: 0.2,
+            min_cache_match_rate: 0.3,
+            spillover_bound_chunks: 4.0,
+            load_check_interval_secs: 1,
+            chars_per_token: 4.0,
+            eviction_interval_secs: 0,
+            max_tree_size: 1000,
+        });
+        assert_eq!(policy.name(), "chunk_aware");
+        assert!(
+            policy.needs_load_updates(),
+            "chunk_aware must opt into load polling or it scores on stale zeros"
+        );
+        assert_eq!(policy.load_check_interval_secs(), Some(1));
+
         let policy = PolicyFactory::create_from_config(&PolicyConfig::Bucket {
             balance_abs_threshold: 10,
             balance_rel_threshold: 1.5,
@@ -145,6 +194,8 @@ mod tests {
         assert!(PolicyFactory::create_by_name("PowerOfTwo").is_some());
         assert!(PolicyFactory::create_by_name("cache_aware").is_some());
         assert!(PolicyFactory::create_by_name("CacheAware").is_some());
+        assert!(PolicyFactory::create_by_name("chunk_aware").is_some());
+        assert!(PolicyFactory::create_by_name("ChunkAware").is_some());
         assert!(PolicyFactory::create_by_name("bucket").is_some());
         assert!(PolicyFactory::create_by_name("Bucket").is_some());
         assert!(PolicyFactory::create_by_name("manual").is_some());

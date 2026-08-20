@@ -270,6 +270,24 @@ pub enum PolicyConfig {
     #[serde(rename = "power_of_two")]
     PowerOfTwo { load_check_interval_secs: u64 },
 
+    /// Chunk-aware routing: places requests by pending prefill work rather than
+    /// by longest prefix match, with prefix affinity as a bounded credit.
+    /// See `policies::chunk_aware` for the scoring model.
+    #[serde(rename = "chunk_aware")]
+    ChunkAware {
+        chunk_size_tokens: usize,
+        long_prefill_threshold_tokens: usize,
+        load_weight: f32,
+        prefill_work_weight: f32,
+        prefix_affinity_credit: f32,
+        min_cache_match_rate: f32,
+        spillover_bound_chunks: f32,
+        load_check_interval_secs: u64,
+        chars_per_token: f32,
+        eviction_interval_secs: u64,
+        max_tree_size: usize,
+    },
+
     #[serde(rename = "bucket")]
     Bucket {
         /// Absolute load difference threshold for load balancing
@@ -345,6 +363,7 @@ impl PolicyConfig {
             PolicyConfig::RoundRobin => "round_robin",
             PolicyConfig::CacheAware { .. } => "cache_aware",
             PolicyConfig::PowerOfTwo { .. } => "power_of_two",
+            PolicyConfig::ChunkAware { .. } => "chunk_aware",
             PolicyConfig::Bucket { .. } => "bucket",
             PolicyConfig::Manual { .. } => "manual",
             PolicyConfig::ConsistentHashing => "consistent_hashing",

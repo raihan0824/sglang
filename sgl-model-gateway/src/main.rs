@@ -147,7 +147,7 @@ struct CliArgs {
 
     // ==================== Routing Policy ====================
     /// Load balancing policy to use
-    #[arg(long, default_value = "cache_aware", value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "prefix_hash", "manual"], help_heading = "Routing Policy")]
+    #[arg(long, default_value = "cache_aware", value_parser = ["random", "round_robin", "cache_aware", "chunk_aware", "power_of_two", "prefix_hash", "manual"], help_heading = "Routing Policy")]
     policy: String,
 
     /// Cache threshold (0.0-1.0) for cache-aware routing
@@ -169,6 +169,46 @@ struct CliArgs {
     /// Maximum size of the approximation tree for cache-aware routing
     #[arg(long, default_value_t = 67108864, help_heading = "Routing Policy")]
     max_tree_size: usize,
+
+    /// Prefill chunk size in tokens (chunk_aware): the unit that converts a
+    /// token backlog into comparable "chunks of queued work"
+    #[arg(long, default_value_t = 8192, help_heading = "Routing Policy")]
+    chunk_aware_chunk_size_tokens: usize,
+
+    /// Requests below this token count route on load and backlog only,
+    /// ignoring prefix affinity (chunk_aware)
+    #[arg(long, default_value_t = 8192, help_heading = "Routing Policy")]
+    chunk_aware_long_prefill_threshold_tokens: usize,
+
+    /// Weight on running-request count (chunk_aware)
+    #[arg(long, default_value_t = 1.5, help_heading = "Routing Policy")]
+    chunk_aware_load_weight: f32,
+
+    /// Weight on queued prefill work (chunk_aware)
+    #[arg(long, default_value_t = 1.0, help_heading = "Routing Policy")]
+    chunk_aware_prefill_work_weight: f32,
+
+    /// Weight on the prefix-affinity credit subtracted from the score (chunk_aware)
+    #[arg(long, default_value_t = 0.2, help_heading = "Routing Policy")]
+    chunk_aware_prefix_affinity_credit: f32,
+
+    /// Minimum prefix match rate before any affinity credit is granted (chunk_aware)
+    #[arg(long, default_value_t = 0.3, help_heading = "Routing Policy")]
+    chunk_aware_min_cache_match_rate: f32,
+
+    /// Backlog gap in chunks beyond which affinity is ignored entirely and the
+    /// least-backlogged worker wins (chunk_aware)
+    #[arg(long, default_value_t = 4.0, help_heading = "Routing Policy")]
+    chunk_aware_spillover_bound_chunks: f32,
+
+    /// Worker load poll interval in seconds (chunk_aware)
+    #[arg(long, default_value_t = 1, help_heading = "Routing Policy")]
+    chunk_aware_load_check_interval_secs: u64,
+
+    /// Characters per token, used to estimate token counts from request text
+    /// (chunk_aware; the router's radix tree stores characters, not token ids)
+    #[arg(long, default_value_t = 4.0, help_heading = "Routing Policy")]
+    chunk_aware_chars_per_token: f32,
 
     /// Maximum idle time in seconds before eviction (for manual policy)
     #[arg(long, default_value_t = 14400, help_heading = "Routing Policy")]
@@ -769,6 +809,19 @@ impl CliArgs {
             },
             "power_of_two" => PolicyConfig::PowerOfTwo {
                 load_check_interval_secs: 5,
+            },
+            "chunk_aware" => PolicyConfig::ChunkAware {
+                chunk_size_tokens: self.chunk_aware_chunk_size_tokens,
+                long_prefill_threshold_tokens: self.chunk_aware_long_prefill_threshold_tokens,
+                load_weight: self.chunk_aware_load_weight,
+                prefill_work_weight: self.chunk_aware_prefill_work_weight,
+                prefix_affinity_credit: self.chunk_aware_prefix_affinity_credit,
+                min_cache_match_rate: self.chunk_aware_min_cache_match_rate,
+                spillover_bound_chunks: self.chunk_aware_spillover_bound_chunks,
+                load_check_interval_secs: self.chunk_aware_load_check_interval_secs,
+                chars_per_token: self.chunk_aware_chars_per_token,
+                eviction_interval_secs: self.eviction_interval,
+                max_tree_size: self.max_tree_size,
             },
             "prefix_hash" => PolicyConfig::PrefixHash {
                 prefix_token_count: self.prefix_token_count,

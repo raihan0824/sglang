@@ -201,6 +201,89 @@ impl ConfigValidator {
                     });
                 }
             }
+            PolicyConfig::ChunkAware {
+                chunk_size_tokens,
+                long_prefill_threshold_tokens: _,
+                load_weight,
+                prefill_work_weight,
+                prefix_affinity_credit,
+                min_cache_match_rate,
+                spillover_bound_chunks,
+                load_check_interval_secs,
+                chars_per_token,
+                eviction_interval_secs,
+                max_tree_size,
+            } => {
+                if *chunk_size_tokens == 0 {
+                    return Err(ConfigError::InvalidValue {
+                        field: "chunk_size_tokens".to_string(),
+                        value: chunk_size_tokens.to_string(),
+                        reason: "Must be > 0".to_string(),
+                    });
+                }
+
+                for (field, value) in [
+                    ("load_weight", *load_weight),
+                    ("prefill_work_weight", *prefill_work_weight),
+                    ("prefix_affinity_credit", *prefix_affinity_credit),
+                ] {
+                    if value < 0.0 || !value.is_finite() {
+                        return Err(ConfigError::InvalidValue {
+                            field: field.to_string(),
+                            value: value.to_string(),
+                            reason: "Must be finite and >= 0.0".to_string(),
+                        });
+                    }
+                }
+
+                if !(0.0..=1.0).contains(min_cache_match_rate) {
+                    return Err(ConfigError::InvalidValue {
+                        field: "min_cache_match_rate".to_string(),
+                        value: min_cache_match_rate.to_string(),
+                        reason: "Must be between 0.0 and 1.0".to_string(),
+                    });
+                }
+
+                if *spillover_bound_chunks < 0.0 || !spillover_bound_chunks.is_finite() {
+                    return Err(ConfigError::InvalidValue {
+                        field: "spillover_bound_chunks".to_string(),
+                        value: spillover_bound_chunks.to_string(),
+                        reason: "Must be finite and >= 0.0".to_string(),
+                    });
+                }
+
+                if *load_check_interval_secs == 0 {
+                    return Err(ConfigError::InvalidValue {
+                        field: "load_check_interval_secs".to_string(),
+                        value: load_check_interval_secs.to_string(),
+                        reason: "Must be > 0".to_string(),
+                    });
+                }
+
+                if *chars_per_token < 1.0 || !chars_per_token.is_finite() {
+                    return Err(ConfigError::InvalidValue {
+                        field: "chars_per_token".to_string(),
+                        value: chars_per_token.to_string(),
+                        reason: "Must be finite and >= 1.0".to_string(),
+                    });
+                }
+
+                if *eviction_interval_secs == 0 {
+                    return Err(ConfigError::InvalidValue {
+                        field: "eviction_interval_secs".to_string(),
+                        value: eviction_interval_secs.to_string(),
+                        reason: "Must be > 0".to_string(),
+                    });
+                }
+
+                if *max_tree_size == 0 {
+                    return Err(ConfigError::InvalidValue {
+                        field: "max_tree_size".to_string(),
+                        value: max_tree_size.to_string(),
+                        reason: "Must be > 0".to_string(),
+                    });
+                }
+            }
             PolicyConfig::Bucket {
                 balance_abs_threshold: _,
                 balance_rel_threshold,

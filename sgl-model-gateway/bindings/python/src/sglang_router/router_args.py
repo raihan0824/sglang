@@ -21,11 +21,12 @@ logger = logging.getLogger(__name__)
 # `policy_from_str` in router.py and the `PolicyType` enum exposed by the Rust
 # binding (sglang_router_rs). The Rust standalone binary (src/main.rs) accepts a
 # subset of these — extending its `value_parser` and `parse_policy` to match is
-# tracked separately.
+# tracked separately. (chunk_aware is wired through both.)
 _POLICY_CHOICES = (
     "random",
     "round_robin",
     "cache_aware",
+    "chunk_aware",
     "power_of_two",
     "bucket",
     "manual",
@@ -63,6 +64,17 @@ class RouterArgs:
     max_tree_size: int = 2**26
     max_idle_secs: int = 4 * 3600
     assignment_mode: str = "random"  # Mode for manual policy new routing key assignment
+    # chunk_aware policy: place requests by pending prefill work, with prefix
+    # affinity as a bounded credit. Defaults mirror the Rust CLI.
+    chunk_aware_chunk_size_tokens: int = 8192
+    chunk_aware_long_prefill_threshold_tokens: int = 8192
+    chunk_aware_load_weight: float = 1.5
+    chunk_aware_prefill_work_weight: float = 1.0
+    chunk_aware_prefix_affinity_credit: float = 0.2
+    chunk_aware_min_cache_match_rate: float = 0.3
+    chunk_aware_spillover_bound_chunks: float = 4.0
+    chunk_aware_load_check_interval_secs: int = 1
+    chunk_aware_chars_per_token: float = 4.0
     max_payload_size: int = 512 * 1024 * 1024  # 512MB default for large batches
     bucket_adjust_interval_secs: int = 5
     dp_aware: bool = False
@@ -349,6 +361,60 @@ class RouterArgs:
             default=RouterArgs.assignment_mode,
             choices=["random", "min_load", "min_group"],
             help="Mode for assigning new routing keys in manual policy: random (default), min_load (worker with fewest requests), min_group (worker with fewest routing keys)",
+        )
+        routing_group.add_argument(
+            f"--{prefix}chunk-aware-chunk-size-tokens",
+            type=int,
+            default=RouterArgs.chunk_aware_chunk_size_tokens,
+            help="Prefill chunk size in tokens (chunk_aware): the unit that converts a token backlog into comparable chunks of queued work",
+        )
+        routing_group.add_argument(
+            f"--{prefix}chunk-aware-long-prefill-threshold-tokens",
+            type=int,
+            default=RouterArgs.chunk_aware_long_prefill_threshold_tokens,
+            help="Requests below this token count route on load and backlog only, ignoring prefix affinity (chunk_aware)",
+        )
+        routing_group.add_argument(
+            f"--{prefix}chunk-aware-load-weight",
+            type=float,
+            default=RouterArgs.chunk_aware_load_weight,
+            help="Weight on running-request count (chunk_aware)",
+        )
+        routing_group.add_argument(
+            f"--{prefix}chunk-aware-prefill-work-weight",
+            type=float,
+            default=RouterArgs.chunk_aware_prefill_work_weight,
+            help="Weight on queued prefill work (chunk_aware)",
+        )
+        routing_group.add_argument(
+            f"--{prefix}chunk-aware-prefix-affinity-credit",
+            type=float,
+            default=RouterArgs.chunk_aware_prefix_affinity_credit,
+            help="Weight on the prefix-affinity credit subtracted from the score (chunk_aware). Its reach is credit * matched_tokens",
+        )
+        routing_group.add_argument(
+            f"--{prefix}chunk-aware-min-cache-match-rate",
+            type=float,
+            default=RouterArgs.chunk_aware_min_cache_match_rate,
+            help="Minimum prefix match rate before any affinity credit is granted (chunk_aware)",
+        )
+        routing_group.add_argument(
+            f"--{prefix}chunk-aware-spillover-bound-chunks",
+            type=float,
+            default=RouterArgs.chunk_aware_spillover_bound_chunks,
+            help="Backlog gap in chunks beyond which affinity is ignored entirely and the least-backlogged worker wins (chunk_aware)",
+        )
+        routing_group.add_argument(
+            f"--{prefix}chunk-aware-load-check-interval-secs",
+            type=int,
+            default=RouterArgs.chunk_aware_load_check_interval_secs,
+            help="Worker load poll interval in seconds (chunk_aware)",
+        )
+        routing_group.add_argument(
+            f"--{prefix}chunk-aware-chars-per-token",
+            type=float,
+            default=RouterArgs.chunk_aware_chars_per_token,
+            help="Characters per token, used to estimate token counts from request text (chunk_aware)",
         )
         routing_group.add_argument(
             f"--{prefix}max-payload-size",

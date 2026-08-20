@@ -27,6 +27,7 @@ def policy_from_str(policy_str: Optional[str]) -> PolicyType:
         "random": PolicyType.Random,
         "round_robin": PolicyType.RoundRobin,
         "cache_aware": PolicyType.CacheAware,
+        "chunk_aware": PolicyType.ChunkAware,
         "power_of_two": PolicyType.PowerOfTwo,
         "bucket": PolicyType.Bucket,
         "manual": PolicyType.Manual,

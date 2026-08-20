@@ -1,7 +1,7 @@
 use std::{
     fmt,
     sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering},
         Arc, LazyLock, RwLock as StdRwLock,
     },
     time::Duration,
@@ -209,6 +209,22 @@ pub trait Worker: Send + Sync + fmt::Debug {
 
     /// Reset the load counter to 0 (for sync/recovery)
     fn reset_load(&self) {}
+
+    /// Uncached prefill tokens the router has dispatched to this worker but which
+    /// the worker has not yet acknowledged in its own reported backlog.
+    ///
+    /// Load-reporting is a poll (seconds); dispatch is immediate. Under a burst,
+    /// every request in the poll window would otherwise see a stale, equal backlog
+    /// on every worker and pile onto the same one. This counter is the router's
+    /// work reservation: added at dispatch, released when the response body drops
+    /// (see `WorkerLoadGuard`). Policies that do not reserve leave it at 0.
+    fn reserved_prefill_tokens(&self) -> i64 {
+        0
+    }
+
+    /// Adjust the reservation counter. `delta` may be negative (release).
+    /// Implementations clamp at 0 so a double-release cannot drive it negative.
+    fn add_reserved_prefill_tokens(&self, _delta: i64) {}
 
     /// Get the worker routing key load tracker
     fn worker_routing_key_load(&self) -> &WorkerRoutingKeyLoad;
@@ -650,6 +666,8 @@ impl WorkerMetadata {
 pub struct BasicWorker {
     pub metadata: WorkerMetadata,
     pub load_counter: Arc<AtomicUsize>,
+    /// Router-side prefill work reservation; see `Worker::reserved_prefill_tokens`.
+    pub reserved_prefill_counter: Arc<AtomicI64>,
     pub worker_routing_key_load: Arc<WorkerRoutingKeyLoad>,
     pub processed_counter: Arc<AtomicUsize>,
     pub healthy: Arc<AtomicBool>,
@@ -783,6 +801,20 @@ impl Worker for BasicWorker {
 
     fn load(&self) -> usize {
         self.load_counter.load(Ordering::Relaxed)
+    }
+
+    fn reserved_prefill_tokens(&self) -> i64 {
+        self.reserved_prefill_counter.load(Ordering::Relaxed)
+    }
+
+    fn add_reserved_prefill_tokens(&self, delta: i64) {
+        // Clamp at 0: a release racing a reconciliation reset must not go negative,
+        // and a negative reservation would make an overloaded worker look idle.
+        let _ = self.reserved_prefill_counter.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |current| Some(current.saturating_add(delta).max(0)),
+        );
     }
 
     fn increment_load(&self) {
@@ -1055,6 +1087,14 @@ impl Worker for DPAwareWorker {
         self.base_worker.load()
     }
 
+    fn reserved_prefill_tokens(&self) -> i64 {
+        self.base_worker.reserved_prefill_tokens()
+    }
+
+    fn add_reserved_prefill_tokens(&self, delta: i64) {
+        self.base_worker.add_reserved_prefill_tokens(delta);
+    }
+
     fn increment_load(&self) {
         self.base_worker.increment_load();
     }
@@ -1147,13 +1187,36 @@ impl Worker for DPAwareWorker {
 pub struct WorkerLoadGuard {
     worker: Arc<dyn Worker>,
     routing_key: Option<String>,
+    /// Prefill tokens reserved for this request, released on drop. 0 for policies
+    /// that do not reserve.
+    reserved_prefill: i64,
 }
 
 impl WorkerLoadGuard {
     pub fn new(worker: Arc<dyn Worker>, headers: Option<&http::HeaderMap>) -> Self {
+        Self::with_prefill_reservation(worker, headers, 0)
+    }
+
+    /// Variant that also reserves `reserved_prefill` uncached prefill tokens on the
+    /// worker for the lifetime of the request.
+    ///
+    /// Attaching the reservation to this guard (rather than tracking it inside the
+    /// policy) means it is released by exactly the same RAII path that releases the
+    /// load counter — including client disconnect, retry, and error paths — and,
+    /// when the guard is attached to the response body via `AttachedBody`, it
+    /// survives until the stream actually ends instead of when the handler returns.
+    pub fn with_prefill_reservation(
+        worker: Arc<dyn Worker>,
+        headers: Option<&http::HeaderMap>,
+        reserved_prefill: i64,
+    ) -> Self {
         use crate::routers::header_utils::extract_routing_key;
 
         worker.increment_load();
+
+        if reserved_prefill > 0 {
+            worker.add_reserved_prefill_tokens(reserved_prefill);
+        }
 
         let routing_key = extract_routing_key(headers).map(String::from);
 
@@ -1164,6 +1227,7 @@ impl WorkerLoadGuard {
         Self {
             worker,
             routing_key,
+            reserved_prefill,
         }
     }
 }
@@ -1171,6 +1235,10 @@ impl WorkerLoadGuard {
 impl Drop for WorkerLoadGuard {
     fn drop(&mut self) {
         self.worker.decrement_load();
+        if self.reserved_prefill > 0 {
+            self.worker
+                .add_reserved_prefill_tokens(-self.reserved_prefill);
+        }
         if let Some(ref key) = self.routing_key {
             self.worker.worker_routing_key_load().decrement(key);
         }
