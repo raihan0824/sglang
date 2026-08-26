@@ -15,8 +15,8 @@ use crate::{
     app_context::AppContext,
     config::types::RetryConfig,
     core::{
-        is_retryable_status, AttachedBody, ConnectionMode, RetryExecutor, Worker, WorkerLoadGuard,
-        WorkerRegistry, WorkerType, UNKNOWN_MODEL_ID,
+        is_retryable_status, is_worker_fault, AttachedBody, ConnectionMode, RetryExecutor, Worker,
+        WorkerLoadGuard, WorkerRegistry, WorkerType, UNKNOWN_MODEL_ID,
     },
     observability::{
         events::{self, Event},
@@ -338,7 +338,12 @@ impl Router {
         // mask "200-then-broken" workers — every request would tick a
         // success before the stream had a chance to error out.
         if !is_stream {
-            worker.record_outcome(status.is_success());
+            // Only server errors count against the worker. A 4xx — including a
+            // 429 from a full request queue — is the worker answering
+            // correctly, and tripping the breaker on it would make the router
+            // reply 503 "no available workers" instead of passing the 429
+            // through. See `is_worker_fault`.
+            worker.record_outcome(!is_worker_fault(status));
         }
 
         // Record worker errors for server errors (5xx)
@@ -596,7 +601,7 @@ impl Router {
                 // here so a worker flapping at the TCP layer doesn't
                 // stay permanently selectable. Non-streaming requests
                 // are already covered by the caller's
-                // `worker.record_outcome(status.is_success())`, so
+                // `worker.record_outcome(!is_worker_fault(status))`, so
                 // gating on `is_stream` avoids double-counting.
                 if is_stream {
                     worker.record_outcome(false);
@@ -649,7 +654,7 @@ impl Router {
                 worker.clone(),
                 worker_url.to_string(),
             );
-            if !status.is_success() {
+            if is_worker_fault(status) {
                 tracked.mark_errored();
             }
             let body = Body::from_stream(tracked);

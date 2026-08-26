@@ -3,9 +3,32 @@ use std::{
     time::{Duration, Instant},
 };
 
+use http::StatusCode;
 use tracing::info;
 
 use crate::observability::metrics::Metrics;
+
+/// Whether an upstream response status should count as a fault by the worker
+/// that produced it.
+///
+/// The circuit breaker exists to route around *broken* workers, so only server
+/// errors count. A 4xx is the worker correctly rejecting a request — a
+/// malformed body (400), an unknown model (404), or backpressure when the
+/// request queue is full (429). None of those mean the worker is unhealthy.
+///
+/// Counting them is actively harmful for 429: after `failure_threshold`
+/// queue-full replies the breaker opens, every worker becomes unavailable, and
+/// the router answers with its own 503 "no available workers". That converts
+/// upstream backpressure into an outage, and turns a 429 (which gateways like
+/// OpenRouter do not count against uptime) into a 5xx (which they do) — the
+/// exact inversion the worker-side 429 was introduced to avoid.
+///
+/// The PD router has always applied this rule; see `pd_router`'s `not_error` /
+/// `decode_ok`. This function is the shared definition so the two paths cannot
+/// drift apart again.
+pub fn is_worker_fault(status: StatusCode) -> bool {
+    !(status.is_success() || status.is_client_error())
+}
 
 /// Circuit breaker configuration
 #[derive(Debug, Clone)]
@@ -622,5 +645,67 @@ mod tests {
         }
 
         assert_eq!(cb.total_failures(), 1000);
+    }
+
+    #[test]
+    fn client_errors_are_not_worker_faults() {
+        // 429 is the case that motivated this: a worker whose request queue is
+        // full answers 429, and the router must pass that through rather than
+        // trip the breaker and answer 503.
+        assert!(!is_worker_fault(StatusCode::TOO_MANY_REQUESTS));
+        assert!(!is_worker_fault(StatusCode::BAD_REQUEST));
+        assert!(!is_worker_fault(StatusCode::NOT_FOUND));
+        assert!(!is_worker_fault(StatusCode::OK));
+        assert!(!is_worker_fault(StatusCode::NO_CONTENT));
+
+        assert!(is_worker_fault(StatusCode::INTERNAL_SERVER_ERROR));
+        assert!(is_worker_fault(StatusCode::BAD_GATEWAY));
+        assert!(is_worker_fault(StatusCode::SERVICE_UNAVAILABLE));
+        assert!(is_worker_fault(StatusCode::GATEWAY_TIMEOUT));
+    }
+
+    #[test]
+    fn sustained_429s_never_open_the_circuit() {
+        // Regression: 429 was recorded as a breaker failure, so after
+        // `failure_threshold` queue-full replies every worker went unavailable
+        // and the router returned 503 "no available workers" instead of the
+        // upstream 429 — inverting a non-deranking status into a deranking one.
+        let cb = CircuitBreaker::with_config_and_label(
+            CircuitBreakerConfig {
+                failure_threshold: 5,
+                ..Default::default()
+            },
+            String::new(),
+        );
+
+        for _ in 0..100 {
+            cb.record_outcome(!is_worker_fault(StatusCode::TOO_MANY_REQUESTS));
+        }
+
+        assert_eq!(cb.state(), CircuitState::Closed);
+        assert!(
+            cb.can_execute(),
+            "a worker applying backpressure must stay selectable"
+        );
+    }
+
+    #[test]
+    fn sustained_5xx_still_opens_the_circuit() {
+        // The converse: genuine faults must still trip it, or the fix above
+        // would have disabled the breaker rather than corrected it.
+        let cb = CircuitBreaker::with_config_and_label(
+            CircuitBreakerConfig {
+                failure_threshold: 5,
+                ..Default::default()
+            },
+            String::new(),
+        );
+
+        for _ in 0..5 {
+            cb.record_outcome(!is_worker_fault(StatusCode::INTERNAL_SERVER_ERROR));
+        }
+
+        assert_eq!(cb.state(), CircuitState::Open);
+        assert!(!cb.can_execute());
     }
 }

@@ -19,7 +19,8 @@ use super::pd_types::api_path;
 use crate::{
     config::types::RetryConfig,
     core::{
-        is_retryable_status, HashRing, RetryExecutor, Worker, WorkerLoadGuard, WorkerRegistry,
+        is_retryable_status, is_worker_fault, HashRing, RetryExecutor, Worker, WorkerLoadGuard,
+        WorkerRegistry,
         WorkerType, UNKNOWN_MODEL_ID,
     },
     observability::{
@@ -447,7 +448,7 @@ impl PDRouter {
                             .get::<BreakerOutcomesRecorded>()
                             .is_some();
                         if !outcomes_already_recorded {
-                            let not_error = status.is_success() || status.is_client_error();
+                            let not_error = !is_worker_fault(status);
                             // Prefill is always non-streaming and fully read before
                             // we get here, so its outcome is final.
                             prefill.record_outcome(not_error);
@@ -812,7 +813,7 @@ impl PDRouter {
                     };
                     prefill.record_outcome(prefill_ok);
                     if !context.is_stream {
-                        let decode_ok = status.is_success() || status.is_client_error();
+                        let decode_ok = !is_worker_fault(status);
                         decode.record_outcome(decode_ok);
                     }
 
@@ -1132,7 +1133,7 @@ impl PDRouter {
         // stream cleanly to None and record a spurious success.
         let mut tracked =
             BreakerTrackedStream::new(stream, Arc::clone(&decode), decode.url().to_string());
-        if !(status.is_success() || status.is_client_error()) {
+        if is_worker_fault(status) {
             tracked.mark_errored();
         }
         let decode_for_log = decode.clone();
