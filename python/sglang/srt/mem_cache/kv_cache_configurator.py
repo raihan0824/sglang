@@ -1041,17 +1041,20 @@ class KVCacheConfigurator:
         max_num_reqs: int,
         extra_max_context_len: int,
     ) -> ReqToTokenPool:
-        # DSPARK/DFLASH commit routes through the backend fold (KDA-only); a
-        # non-KDA model there would scatter a None intermediate_ssm and crash.
+        # DSPARK/DFLASH commit routes through the backend
+        # (update_mamba_state_after_mtp_verify), which folds the accepted ring
+        # window for KDA and GDN. Any other mamba-ish model would scatter a None
+        # intermediate_ssm and crash, so keep refusing it there.
         _algo = (get_spec().speculative_algorithm or "").upper()
         if (
             get_exec().mamba.enable_linear_replayssm_spec
             and _algo in ("DSPARK", "DFLASH")
             and kimi_linear_config(self.model_config) is None
+            and self.hybrid_gdn_config is None
         ):
             raise ValueError(
                 "--enable-linear-replayssm-spec with DSPARK/DFLASH requires a KDA "
-                "(kimi_linear) model; got a non-KDA model."
+                "(kimi_linear) or GDN hybrid model; got neither."
             )
         req_to_token_pool = HybridReqToTokenPool(
             size=max_num_reqs,
