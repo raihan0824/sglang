@@ -1679,6 +1679,27 @@ class ModelRunner:
             or forward_batch.forward_mode.is_draft_extend_v2()
         ):
             return
+
+        # The slot index tensors are assembled on the host. Indexing the GPU
+        # pool with a host tensor makes torch do a blocking H2D copy, which
+        # waits for every kernel already queued on the stream (the previous
+        # decode/verify step, ~13 ms at bs 64) before this extend can even be
+        # launched. Stage them through pinned memory and copy asynchronously so
+        # the extend's launches overlap the tail of the previous step.
+        def _to_device_async(t: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+            if t is None or t.device.type != "cpu":
+                return t
+            return t.pin_memory().to(self.device, non_blocking=True)
+
+        forward_batch.mamba_clear_indices = _to_device_async(
+            forward_batch.mamba_clear_indices
+        )
+        forward_batch.mamba_cow_src_indices = _to_device_async(
+            forward_batch.mamba_cow_src_indices
+        )
+        forward_batch.mamba_cow_dst_indices = _to_device_async(
+            forward_batch.mamba_cow_dst_indices
+        )
         if (
             forward_batch.mamba_clear_indices is not None
             and len(forward_batch.mamba_clear_indices) > 0

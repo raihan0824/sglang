@@ -966,7 +966,12 @@ class MambaPool:
             fused_clear_conv_slots(self._conv_slot_desc, indices)
             temporal = self.mamba_cache.temporal
             if temporal.numel() > 0:
-                temporal[:, indices] = 0
+                # `temporal[:, indices] = 0` stages the Python scalar as a 0-dim
+                # CPU tensor and copies it H2D synchronously, which blocks the
+                # host until every kernel already queued on the stream (the
+                # previous verify step) has drained. index_fill_ passes the
+                # scalar as a kernel argument: same result, no stream sync.
+                temporal.index_fill_(1, indices.to(torch.int64), 0)
             return
         if not _is_npu:
             need_size = len(indices)
@@ -1028,14 +1033,17 @@ class MambaPool:
             self.mamba_cache.temporal[:, dst_indices] = self.mamba_cache.temporal[
                 :, src_indices
             ]
+        # Scalar index assignments on CUDA tensors stage a host scalar and copy
+        # it synchronously (stream sync); index_fill_ does not.
+        _dst64 = dst_indices.to(torch.int64)
         if self.replayssm_write_pos is not None:
-            self.replayssm_write_pos[dst_indices] = 0
+            self.replayssm_write_pos.index_fill_(0, _dst64, 0)
         # ReplaySSM spec-verify ring: a copied checkpoint has no pending ring
         # entries, so its rolling origin + flush flag reset alongside write_pos.
         if self.replayssm_cache_base is not None:
-            self.replayssm_cache_base[dst_indices] = 0
+            self.replayssm_cache_base.index_fill_(0, _dst64, 0)
         if self.replayssm_is_flush is not None:
-            self.replayssm_is_flush[dst_indices] = 0
+            self.replayssm_is_flush.index_fill_(0, _dst64, 0)
 
     def get_cpu_copy(self, indices):
         current_platform.synchronize()
