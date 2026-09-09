@@ -45,6 +45,14 @@ _fused_decode_proj_conv_fallback_logged = False
 _fused_decode_proj_conv_layers_logged: set[int] = set()
 _fused_decode_real_tensor_verified_layers: set[int] = set()
 _fused_decode_log_layer_hits = envs.SGLANG_GDN_DECODE_FUSION_LOG_LAYER_HITS.get()
+
+# Short prefills (chat turns of a few dozen tokens) pay ~0.6 ms of host time per
+# GDN layer in the chunked prefill path (FlashInfer CuTe-DSL launch + ~10 glue
+# ops), 30x per step, while the GPU work is ~10 us. Route them through the
+# single-launch fused recurrent kernel instead (in-kernel gating + l2norm,
+# in-place state read/write via slot indices). Chunked path stays for anything
+# longer, for radix mamba tracking and for state checkpoints.
+_SHORT_PREFILL_RECURRENT_MAX_TOKENS = 64
 _fused_decode_verify_real_tensors = (
     envs.SGLANG_GDN_DECODE_FUSION_VERIFY_REAL_TENSORS.get()
 )
@@ -813,6 +821,32 @@ class GDNAttnBackend(MambaAttnBackendBase):
             key = key.view(1, actual_seq_len, layer.num_k_heads, layer.head_k_dim)
             value = value.view(1, actual_seq_len, layer.num_v_heads, layer.head_v_dim)
 
+        if (
+            not is_target_verify
+            and _SHORT_PREFILL_RECURRENT_MAX_TOKENS > 0
+            and actual_seq_len <= _SHORT_PREFILL_RECURRENT_MAX_TOKENS
+            and is_cuda()
+            and not forward_metadata.has_mamba_track_mask
+            and int(getattr(forward_metadata, "num_state_checkpoints", 0) or 0) == 0
+            and retrieve_parent_token is None
+        ):
+            core_attn_out = self._short_prefill_recurrent(
+                layer=layer,
+                query=query,
+                key=key,
+                value=value,
+                a=a,
+                b=b,
+                ssm_states=ssm_states_contig,
+                cache_indices=state_cache_indices,
+                query_start_loc=query_start_loc,
+                has_initial_states=has_initial_states,
+            )
+            if needs_state_gather:
+                conv_states[cache_indices] = conv_states_contig
+                ssm_states[cache_indices] = ssm_states_contig
+            return core_attn_out
+
         if is_target_verify:
             # ReplaySSM verify protocols: fold-every-commit (ring-write during
             # verify, fold on commit), circular ring, or the snapshotting
@@ -921,6 +955,51 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 )
 
         return core_attn_out
+
+    def _short_prefill_recurrent(
+        self,
+        *,
+        layer: RadixLinearAttention,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        ssm_states: torch.Tensor,
+        cache_indices: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        has_initial_states: torch.Tensor,
+    ) -> torch.Tensor:
+        """Single-launch recurrent GDN prefill for short extends.
+
+        Same math as the decode kernel with T > 1 per row (varlen via
+        cu_seqlens). The chunked path masks the initial state with
+        ``has_initial_states``; the recurrent kernel reads the slot in place, so
+        rows without a cached prefix get their slot cleared first (no host sync:
+        a gather-scale-scatter over the batch's slots).
+        """
+        from sglang.kernels.ops.attention.fla.fused_sigmoid_gating_recurrent import (
+            fused_sigmoid_gating_delta_rule_update,
+        )
+
+        idx = cache_indices.to(torch.int64)
+        keep = has_initial_states.to(ssm_states.dtype).view(-1, 1, 1, 1)
+        ssm_states[idx] = ssm_states[idx] * keep
+        return fused_sigmoid_gating_delta_rule_update(
+            A_log=layer.A_log,
+            dt_bias=layer.dt_bias,
+            q=query,
+            k=key,
+            v=value,
+            a=a,
+            b=b,
+            initial_state_source=ssm_states,
+            initial_state_indices=cache_indices,
+            cu_seqlens=query_start_loc,
+            use_qk_l2norm_in_kernel=True,
+            softplus_beta=1.0,
+            softplus_threshold=20.0,
+        )
 
     def _replayssm_fold_target_verify(
         self,
