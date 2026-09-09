@@ -103,6 +103,14 @@ def _dflash_draft_cell_size(kvc: KVCacheConfigurator) -> int:
     """
     if kvc.is_draft_worker or not kvc.spec_algorithm.is_dflash_family():
         return 0
+    # Per-request draft ring pool (draft windowing, page size 1): the draft KV
+    # is a fixed (window + block) region per request slot, not a per-token
+    # cost on the target budget; its ~1 GB comes out of the non-static share.
+    if (
+        get_spec().speculative_draft_window_size is not None
+        and int(get_schedule().page_size) == 1
+    ):
+        return 0
     cell_size = kvc.spec_aux_config.dflash_draft_cell_size_per_token
     if cell_size is None or int(cell_size) <= 0:
         return 0

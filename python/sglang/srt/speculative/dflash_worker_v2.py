@@ -388,6 +388,23 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._draft_block_spec_info = make_draft_block_spec_info(
             draft_token_num=int(self.block_size), device=self.device
         )
+        # Per-request draft KV ring. With draft windowing the draft cache used
+        # to be indexed by TARGET cache locations (so the draft pool had to be
+        # as large as the target pool, ~17 GB on Qwen3.6 at 1.5M tokens). The
+        # ring keeps one fixed region per request slot of `window + block`
+        # slots: loc = 1 + slot * stride + (position mod stride). Draft KV of a
+        # radix-cached prefix is not shared any more; such requests start with
+        # an empty ring (the drafter sees less context, verification keeps the
+        # output exact). Page size 1 only (the ring is not page-aligned).
+        self.use_draft_ring_pool = bool(
+            self.use_compact_draft_cache and int(self.page_size) == 1
+        )
+        self._ring_stride = int(self.draft_window_size or 0) + int(self.block_size)
+        self._ring_arange = torch.arange(
+            self._ring_stride + int(self.block_size),
+            dtype=torch.int64,
+            device=self.device,
+        )
         self._draft_greedy_gathered_max_buf: Optional[torch.Tensor] = None
         self._draft_greedy_gathered_ids_buf: Optional[torch.Tensor] = None
         self._draft_greedy_gather_cap: int = 0
@@ -445,6 +462,39 @@ class DFlashWorkerV2(BaseSpecWorker):
         # enabled, the draft worker keeps a private compact req->token table
         # over the same global KV index space, so radix-cache/prefix-hit KV
         # remains reusable while draft attention sees only the recent window.
+        if self.use_draft_ring_pool and memory_pool_config is not None:
+            import dataclasses
+
+            # Request slots are 1..size (slot 0 is the pad row), so the ring
+            # needs size + 1 regions; ReqToTokenPool keeps that as _alloc_size.
+            n_slots = int(
+                getattr(req_to_token_pool, "_alloc_size", None)
+                or (int(getattr(req_to_token_pool, "size", 0) or 0) + 1)
+                or (int(memory_pool_config.max_running_requests or 0) + 1)
+            )
+            if n_slots <= 0:
+                raise RuntimeError(
+                    "DFLASH draft ring pool: unknown request slot count."
+                )
+            ring_tokens = 1 + n_slots * self._ring_stride
+            draft_cfg = dataclasses.replace(
+                memory_pool_config, max_total_num_tokens=ring_tokens
+            )
+            if self.ps.tp_rank == 0:
+                logger.info(
+                    "DFLASH draft ring pool: %d slots x stride %d = %d draft KV "
+                    "tokens (target pool %d).",
+                    n_slots,
+                    self._ring_stride,
+                    ring_tokens,
+                    int(memory_pool_config.max_total_num_tokens),
+                )
+            self._draft_worker.alloc_memory_pool(
+                memory_pool_config=draft_cfg,
+                req_to_token_pool=None,
+                token_to_kv_pool_allocator=None,
+            )
+            return
         self._draft_worker.alloc_memory_pool(
             memory_pool_config=memory_pool_config,
             req_to_token_pool=(
@@ -823,6 +873,46 @@ class DFlashWorkerV2(BaseSpecWorker):
         else:
             # Last resort: the legacy blocking D2H copy.
             out.copy_(draft_prefix_lens)
+
+    def _ring_locs_2d(
+        self, req_pool_indices: torch.Tensor, start_pos: torch.Tensor, length: int
+    ) -> torch.Tensor:
+        """[bs, length] draft ring locations for positions start_pos + [0, length)."""
+        S = self._ring_stride
+        r = req_pool_indices.to(torch.int64).unsqueeze(1)
+        pos = start_pos.to(torch.int64).unsqueeze(1) + self._ring_arange[:length]
+        return 1 + r * S + torch.remainder(pos, S)
+
+    def _ring_start_for_batch(self, batch: ScheduleBatch) -> torch.Tensor:
+        """Absolute position of the first ring entry per request (pinned at the
+        request's first prefill = its cached prefix length). Host list -> device
+        through pinned memory, non-blocking, so it never syncs the stream."""
+        vals = [int(getattr(req, "_dflash_ring_start", 0)) for req in batch.reqs]
+        t = torch.tensor(vals, dtype=torch.int64).pin_memory()
+        return t.to(self.device, non_blocking=True)
+
+    def _ring_draft_prefix_lens(
+        self, prefix_lens: torch.Tensor, ring_start: torch.Tensor
+    ) -> torch.Tensor:
+        window = int(self.draft_window_size)
+        avail = prefix_lens.to(torch.int64) - ring_start
+        return torch.clamp(avail, min=0, max=window).to(torch.int32)
+
+    def _rebuild_ring_draft_cache(
+        self,
+        *,
+        req_pool_indices: torch.Tensor,
+        prefix_lens: torch.Tensor,
+        draft_prefix_lens: torch.Tensor,
+    ) -> None:
+        """Draft row [0, prefix + block) = ring locs of the positions
+        [prefix_lens - draft_prefix_lens, prefix_lens + block). The row is written
+        over its full ring width; the unused tail is never read."""
+        suffix_start = prefix_lens.to(torch.int64) - draft_prefix_lens.to(torch.int64)
+        width = self._ring_stride + int(self.block_size)
+        rows = self._ring_locs_2d(req_pool_indices, suffix_start, width)
+        table = self.draft_model_runner.req_to_token_pool.req_to_token
+        table[req_pool_indices.to(torch.int64), :width] = rows.to(table.dtype)
 
     def _rebuild_compact_draft_cache(
         self,
@@ -1804,9 +1894,32 @@ class DFlashWorkerV2(BaseSpecWorker):
                 ctx_lens,
                 int(sum(batch.extend_lens)),
             )
+            draft_cache_loc = batch.out_cache_loc
+            if self.use_draft_ring_pool:
+                # First prefill of a request pins its ring start at the cached
+                # prefix length; chunked continuations keep the first value.
+                for req, pre in zip(batch.reqs, batch.prefix_lens):
+                    if getattr(req, "_dflash_ring_start", None) is None:
+                        req._dflash_ring_start = int(pre)
+                S = self._ring_stride
+                W = int(self.draft_window_size)
+                ctx64 = ctx_lens.to(torch.int64)
+                r_tok = torch.repeat_interleave(
+                    batch.req_pool_indices.to(torch.int64), ctx64
+                )
+                end_tok = torch.repeat_interleave(
+                    draft_seq_lens.to(torch.int64) + ctx64, ctx64
+                )
+                pos64 = positions.to(torch.int64)
+                ring = 1 + r_tok * S + torch.remainder(pos64, S)
+                # Tokens outside the trailing window go to slot 0 (the pool's
+                # pad slot, never read), so the scatter has no live duplicates.
+                draft_cache_loc = torch.where(
+                    pos64 >= end_tok - W, ring, torch.zeros_like(ring)
+                )
             self._append_target_hidden_to_draft_kv_by_loc(
                 target_hidden=logits_output.hidden_states,
-                cache_loc=batch.out_cache_loc,
+                cache_loc=draft_cache_loc,
                 positions=positions,
             )
 
@@ -1950,6 +2063,10 @@ class DFlashWorkerV2(BaseSpecWorker):
         verify_out_cache_loc = verify_out_cache_loc_2d.reshape(-1)
 
         seq_lens_cpu = self._draft_seq_lens_cpu_buf[:bs]
+        # Where the draft writes its verify-block KV: target locs unless the
+        # per-request ring pool is on (then set in the compact branch below).
+        draft_out_cache_loc = verify_out_cache_loc
+        draft_out_cache_loc_2d = verify_out_cache_loc_2d
         if self.use_compact_draft_cache:
             # Rebuild the draft-local sliding-window view from committed target state.
             draft_prefix_lens = self._compute_compact_draft_seq_lens(prefix_lens)
@@ -1959,14 +2076,29 @@ class DFlashWorkerV2(BaseSpecWorker):
                 draft_prefix_lens=draft_prefix_lens,
                 out=seq_lens_cpu,
             )
-            self._rebuild_compact_draft_cache(
-                req_pool_indices=batch.req_pool_indices,
-                prefix_lens=prefix_lens,
-                draft_prefix_lens=draft_prefix_lens,
-                verify_out_cache_loc_2d=verify_out_cache_loc_2d,
-                bs=bs,
-                block_size=block_size,
-            )
+            if self.use_draft_ring_pool:
+                ring_start = self._ring_start_for_batch(batch)
+                draft_prefix_lens = self._ring_draft_prefix_lens(
+                    prefix_lens, ring_start
+                )
+                self._rebuild_ring_draft_cache(
+                    req_pool_indices=batch.req_pool_indices,
+                    prefix_lens=prefix_lens,
+                    draft_prefix_lens=draft_prefix_lens,
+                )
+                draft_out_cache_loc_2d = self._ring_locs_2d(
+                    batch.req_pool_indices, prefix_lens, block_size
+                )
+                draft_out_cache_loc = draft_out_cache_loc_2d.reshape(-1)
+            else:
+                self._rebuild_compact_draft_cache(
+                    req_pool_indices=batch.req_pool_indices,
+                    prefix_lens=prefix_lens,
+                    draft_prefix_lens=draft_prefix_lens,
+                    verify_out_cache_loc_2d=verify_out_cache_loc_2d,
+                    bs=bs,
+                    block_size=block_size,
+                )
             draft_seq_lens = draft_prefix_lens
             draft_seq_lens_sum = int(seq_lens_cpu.sum().item())
         else:
@@ -1993,7 +2125,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             input_ids=block_ids.flatten(),
             req_pool_indices=batch.req_pool_indices,
             seq_lens=draft_seq_lens,
-            out_cache_loc=verify_out_cache_loc,
+            out_cache_loc=draft_out_cache_loc,
             seq_lens_sum=draft_seq_lens_sum,
             seq_lens_cpu=seq_lens_cpu,
             positions=positions,
@@ -2196,8 +2328,8 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         self._append_target_hidden_to_draft_kv_by_loc(
             target_hidden=hidden.reshape(-1, hidden.shape[-1]),
-            cache_loc=verify_out_cache_loc,
-            cache_loc_2d=verify_out_cache_loc_2d,
+            cache_loc=draft_out_cache_loc,
+            cache_loc_2d=draft_out_cache_loc_2d,
             positions=positions,
             commit_lens=commit_lens,
         )
