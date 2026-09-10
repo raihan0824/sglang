@@ -56,8 +56,10 @@ def get_model_config(
         first_group = next(iter(config_groups.values()), {})
         weights_config = first_group.get("weights", {})
         group_size = weights_config.get("group_size")
-        block_shape = [0, group_size]
-        assert len(block_shape) == 2
+        # Per-channel / per-tensor schemes (e.g. FP8-dynamic) have no group size.
+        if group_size is not None:
+            block_shape = [0, group_size]
+            assert len(block_shape) == 2
     # Replace config with text_config for encoder-decoder models after getting block_shape and architecture
     if hasattr(config, "text_config"):
         text_config = config.get_text_config()
@@ -82,10 +84,8 @@ def get_model_config(
         "Qwen3MoeForCausalLM",
         "Qwen3NextForCausalLM",
         "Qwen3VLMoeForConditionalGeneration",
-        "Qwen3_5MoeForCausalLM",
         "Qwen3_5MoeForConditionalGeneration",
         "InternS2PreviewForConditionalGeneration",
-        "MellumForCausalLM",
     ]:
         E = config.num_experts // ep_size
         topk = config.num_experts_per_tok
@@ -97,7 +97,6 @@ def get_model_config(
         "DeepseekV4ForCausalLM",
         "Glm4MoeForCausalLM",
         "GlmMoeDsaForCausalLM",
-        "KimiVLForConditionalGeneration",
         "MistralLarge3ForCausalLM",
     ]:
         E = (config.n_routed_experts // ep_size) + (
@@ -137,7 +136,6 @@ def get_model_config(
         "BailingMoEForCausalLM",
         "BailingMoeForCausalLM",
         "BailingMoeV2ForCausalLM",
-        "BailingMoeV3ForCausalLM",
     ]:
         E = config.num_experts // ep_size
         topk = config.num_experts_per_tok
