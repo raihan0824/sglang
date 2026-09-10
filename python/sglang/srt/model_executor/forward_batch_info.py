@@ -618,6 +618,13 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # forward-path re-plan would clobber their metadata.
     forward_metadata_replan_equivalent: bool = False
 
+    # DFLASH fused prefill+verify: the last `spec_tail_rows` rows of an EXTEND
+    # batch are draft blocks of `spec_tail_block` tokens (verify path in the
+    # linear-attention backend, tail logits from the logits processor).
+    spec_tail_rows: int = 0
+    spec_tail_block: int = 0
+    spec_tail_tokens: int = 0
+
     def mark_forward_metadata_ready(self, replan_equivalent: bool = False):
         """Record that attention metadata was pre-planned for this batch.
 

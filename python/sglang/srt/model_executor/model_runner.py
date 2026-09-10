@@ -1796,6 +1796,7 @@ class ModelRunner:
                 forward_batch.forward_mode.is_extend(include_draft_extend_v2=True)
                 and not isinstance(self.prefill_cuda_graph_runner, EagerRunner)
                 and self.prefill_cuda_graph_runner is not None
+                and int(getattr(forward_batch, "spec_tail_rows", 0) or 0) == 0
                 and self.prefill_cuda_graph_runner.can_run_graph(forward_batch)
                 and _prefill_cuda_graph_allows_context_parallel(
                     self.prefill_cuda_graph_runner, forward_batch

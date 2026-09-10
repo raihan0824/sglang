@@ -183,6 +183,9 @@ class LogitsProcessorOutput:
     # Used by speculative decoding (EAGLE)
     # The last hidden layers
     hidden_states: Optional[torch.Tensor] = None
+    # Fused prefill+verify (DFLASH): full logits of the trailing spec rows
+    # [n_tail * block, vocab], computed from the final hidden states.
+    spec_tail_logits: Optional[torch.Tensor] = None
 
     ## Part 2: This part will be assigned in python/sglang/srt/layers/sampler.py::Sampler
     # he log probs of output tokens, if SGLANG_RETURN_ORIGINAL_LOGPROB = True, will get the log probs before applying temperature. If False, will get the log probs before applying temperature.
@@ -238,6 +241,9 @@ class LogitsProcessorOutput:
 class LogitsMetadata:
     forward_mode: ForwardMode
     capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.NULL
+    # Fused prefill+verify (DFLASH): number of trailing tokens whose full
+    # logits are needed for verification (0 = none).
+    spec_tail_tokens: int = 0
     next_token_logits_buffer: Optional[torch.Tensor] = None
 
     extend_return_logprob: bool = False
@@ -310,6 +316,7 @@ class LogitsMetadata:
             draft_extend_select_index = None
 
         return cls(
+            spec_tail_tokens=int(getattr(forward_batch, "spec_tail_tokens", 0) or 0),
             forward_mode=forward_batch.forward_mode,
             capture_hidden_mode=forward_batch.capture_hidden_mode,
             next_token_logits_buffer=forward_batch.next_token_logits_buffer,
@@ -488,6 +495,16 @@ class LogitsProcessor(nn.Module):
             sample_indices,
             logits_metadata,
         )
+        spec_tail_logits = None
+        if logits_metadata.spec_tail_tokens > 0:
+            # Fused prefill+verify: the trailing draft-block rows need full
+            # logits (their last-token logits are not enough to verify).
+            spec_tail_logits = self._get_logits(
+                hidden_states[-logits_metadata.spec_tail_tokens :],
+                lm_head,
+                logits_metadata,
+                use_logits_buffer=False,
+            )
         del hidden_states
 
         if not logits_metadata.extend_return_logprob:
@@ -502,6 +519,7 @@ class LogitsProcessor(nn.Module):
                 next_token_logits=sampled_logits,
                 hidden_states=hidden_states_to_store,
                 mm_input_embeds=logits_metadata.mm_input_embeds,
+                spec_tail_logits=spec_tail_logits,
             )
 
         logprobs_result, sampled_logits = self.input_logprob_processor.forward(
@@ -519,6 +537,7 @@ class LogitsProcessor(nn.Module):
             next_token_logits=sampled_logits,
             hidden_states=hidden_states_to_store,
             mm_input_embeds=logits_metadata.mm_input_embeds,
+            spec_tail_logits=spec_tail_logits,
         )
         logprobs_result.write_input_to(logits_output)
         return logits_output

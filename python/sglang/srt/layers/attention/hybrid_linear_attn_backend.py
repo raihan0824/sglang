@@ -1247,7 +1247,6 @@ class HybridLinearAttnBackend(AttentionBackend):
         slot ids instead of reusing this step's ``forward_metadata``; the scatter
         below reads the metadata it just planned.
         """
-        del req_pool_indices
         request_number = last_correct_step_indices.shape[0]
 
         # `mamba_track_indices` is VIRTUAL; the scatter writes physical views.
@@ -1256,11 +1255,21 @@ class HybridLinearAttnBackend(AttentionBackend):
                 mamba_track_indices
             )
 
-        state_indices_tensor = (
-            self.linear_attn_backend.forward_metadata.mamba_cache_indices[
-                :request_number
-            ]
-        )
+        if req_pool_indices is not None:
+            # Fused prefill+verify steps put the verify rows LAST in the forward,
+            # so re-derive their slots from the request ids instead of taking the
+            # first `request_number` rows of this step's metadata.
+            state_indices_tensor = self.linear_attn_backend._translate_mamba_indices(
+                self.linear_attn_backend.req_to_token_pool.get_mamba_indices(
+                    req_pool_indices[:request_number]
+                )
+            )
+        else:
+            state_indices_tensor = (
+                self.linear_attn_backend.forward_metadata.mamba_cache_indices[
+                    :request_number
+                ]
+            )
 
         req_pool = self.linear_attn_backend.req_to_token_pool
         mamba_caches = req_pool.get_speculative_mamba2_params_all_layers()

@@ -13,6 +13,7 @@
 # ==============================================================================
 """A scheduler that manages a tensor parallel GPU worker."""
 
+import contextlib
 import dataclasses
 import faulthandler
 import logging
@@ -352,6 +353,9 @@ else:
 
 
 logger = logging.getLogger(__name__)
+
+# Fused prefill+verify step for DFLASH under --enable-mixed-chunk (overlap only).
+_DFLASH_FUSED_MIXED = True
 
 
 def _prewarm_hccl_group(device, group, device_module):
@@ -1850,6 +1854,10 @@ class Scheduler(
             # Process the results of the last batch
             tmp_batch, tmp_result = self.result_queue.popleft()
             self.process_batch_result(tmp_batch, tmp_result)
+            pb = getattr(tmp_result, "piggyback", None)
+            if pb is not None:
+                # Fused prefill+verify: the running rows' spec result.
+                self.process_batch_result(pb[0], pb[1])
 
         while True:
             if self.gracefully_exit:
@@ -3501,6 +3509,27 @@ class Scheduler(
 
         return res
 
+    def _dflash_fused_mixed_ok(
+        self, new_batch: ScheduleBatch, running_batch: ScheduleBatch
+    ) -> bool:
+        if not (_DFLASH_FUSED_MIXED and self.enable_overlap):
+            return False
+        if not self.spec_algorithm.is_dflash_family():
+            return False
+        if running_batch.spec_info is None or running_batch.forward_mode.is_idle():
+            return False
+        if new_batch.has_grammar or running_batch.has_grammar:
+            return False
+        if new_batch.return_logprob or running_batch.return_logprob:
+            return False
+        if new_batch.input_embeds is not None or new_batch.encoder_lens is not None:
+            return False
+        if getattr(new_batch, "multimodal_inputs", None) and any(
+            m is not None for m in new_batch.multimodal_inputs
+        ):
+            return False
+        return True
+
     def get_new_batch_prefill(self, running_batch: ScheduleBatch) -> NextBatchPlan:
         prefill_delayer_single_pass = None
         if self.prefill_delayer:
@@ -3817,6 +3846,14 @@ class Scheduler(
             running_batch.filter_batch()
             if not running_batch.is_empty():
                 running_batch.prepare_for_decode()
+                if self._dflash_fused_mixed_ok(new_batch, running_batch):
+                    # Fused prefill+verify: the running rows keep their draft
+                    # block; the worker runs it inside the prefill forward and
+                    # returns their spec result on the prefill result. The
+                    # running batch stays as it is (no 1-token degrade).
+                    new_batch.spec_piggyback = running_batch
+                    new_batch.decoding_reqs = None
+                    return new_batch, running_batch
                 new_batch.mix_with_running(running_batch)
                 new_batch.decoding_reqs = running_batch.reqs
                 if not self.enable_overlap and not self.spec_algorithm.is_none():
@@ -4057,7 +4094,20 @@ class Scheduler(
                     # post-forward must not un-consume staging.
                     resolve_forward_inputs(batch, self.future_map)
 
-                    with self._forward_isolation(batch, overlap=True):
+                    piggy = getattr(batch, "spec_piggyback", None)
+                    if piggy is not None:
+                        # The piggybacked running batch is a decode batch in
+                        # its own right: resolve its overlap futures (bonus
+                        # tokens, seq lens) exactly as a decode step would.
+                        resolve_forward_inputs(piggy, self.future_map)
+                    with contextlib.ExitStack() as _iso:
+                        _iso.enter_context(
+                            self._forward_isolation(batch, overlap=True)
+                        )
+                        if piggy is not None:
+                            _iso.enter_context(
+                                self._forward_isolation(piggy, overlap=True)
+                            )
                         future_indices = batch.req_pool_indices
 
                         # Spec_v2 fires on_publish mid-worker (between verify and
@@ -4078,6 +4128,10 @@ class Scheduler(
                                 )
 
                         # FIXME: pp is not compatible with overlap
+                        if piggy is not None:
+                            fwd_kwargs["on_publish_spec"] = partial(
+                                self.future_map.publish, piggy.req_pool_indices
+                            )
                         batch_result = self.model_worker.forward_batch_generation(
                             batch, **fwd_kwargs
                         )
@@ -4129,6 +4183,32 @@ class Scheduler(
                                     )
                         else:
                             batch_result.future_indices = future_indices
+                        pr = getattr(batch_result, "piggyback_result", None)
+                        if pr is not None:
+                            piggy = batch.spec_piggyback
+                            pidx = piggy.req_pool_indices
+                            pr.copy_done = self.device_module.Event()
+                            self._relay_forward_payload(piggy, pidx, pr)
+                            self.copy_stream.wait_stream(self.forward_stream)
+                            with self.copy_stream_ctx:
+                                pr.copy_to_cpu(
+                                    return_logprob=False, return_hidden_states=False
+                                )
+
+                pr = getattr(batch_result, "piggyback_result", None)
+                if pr is not None:
+                    # After the isolation restore (which reverted the worker's
+                    # in-forward edits on the piggybacked batch), install what
+                    # carries to its next iter, as done for `batch` below.
+                    piggy = batch.spec_piggyback
+                    piggy.spec_info = pr.next_draft_input
+                    piggy.spec_info.future_dsa_topk_indices_available = (
+                        piggy.spec_info.dsa_topk_indices is not None
+                    )
+                    piggy.spec_info.future_indices = piggy.req_pool_indices
+                    piggy.input_ids = None
+                    batch_result.piggyback = (piggy.copy(), pr)
+                    batch.spec_piggyback = None
 
                 # Next-iter input_ids relayed via future_map.
                 batch.input_ids = None

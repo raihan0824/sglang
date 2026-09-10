@@ -92,6 +92,11 @@ class GenerationBatchResult:
 
     # relay path: forward stream -> next step forward
     next_draft_input: Optional[EagleDraftInput] = None
+    # Fused prefill+verify step (DFLASH): the running rows' spec result rides
+    # on the prefill batch's result; the scheduler re-attaches it to the
+    # running batch (`piggyback` = (batch copy, result) for processing).
+    piggyback_result: Optional["GenerationBatchResult"] = None
+    piggyback: Optional[tuple] = None
 
     # Refs the worker wants scheduler to keep alive for the same 2-iter window
     # as batch_record_buf. Used for cross-stream tensor lifetime (e.g. a spec

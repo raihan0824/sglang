@@ -1,3 +1,4 @@
+import types
 from typing import Optional, Tuple, Union
 
 import torch
@@ -18,7 +19,7 @@ from sglang.srt.layers.attention.linear.utils import (
 )
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.mem_cache.memory_pool import MambaPool
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.runtime_context import get_exec, get_memory, get_schedule
 from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_npu, is_xpu
@@ -700,6 +701,111 @@ class GDNAttnBackend(MambaAttnBackendBase):
         b: torch.Tensor,
         **kwargs,
     ):
+        n_tail = int(getattr(forward_batch, "spec_tail_rows", 0) or 0)
+        if n_tail > 0 and not forward_batch.forward_mode.is_target_verify():
+            return self._forward_extend_with_spec_tail(
+                layer, forward_batch, mixed_qkv, a, b, n_tail, **kwargs
+            )
+        return self._forward_extend_impl(
+            layer, forward_batch, mixed_qkv, a, b, self.forward_metadata, **kwargs
+        )
+
+    def _forward_extend_with_spec_tail(
+        self,
+        layer: RadixLinearAttention,
+        forward_batch: ForwardBatch,
+        mixed_qkv: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        n_tail: int,
+        **kwargs,
+    ):
+        """Fused prefill+verify step: rows [0, bs-n_tail) are prefill rows
+        (chunked prefill path, state advanced in place); the last n_tail rows
+        are DFLASH draft blocks of `spec_tail_block` tokens each and go through
+        the verify path (ring write / snapshots, no state update; the commit
+        happens after acceptance as in a normal verify step)."""
+        import dataclasses
+
+        assert isinstance(mixed_qkv, torch.Tensor)
+        md = self.forward_metadata
+        B = int(getattr(forward_batch, "spec_tail_block"))
+        bs = int(md.query_start_loc.shape[0]) - 1
+        R = bs - n_tail
+        T_tail = n_tail * B
+        T = int(mixed_qkv.shape[0])
+        P = T - T_tail
+        assert P >= 0 and R >= 0, (T, T_tail, bs, n_tail)
+        kw = {k: v for k, v in kwargs.items() if k != "linear_attn_output"}
+        kw["linear_attn_output"] = None
+        fields = {f.name for f in dataclasses.fields(md)}
+
+        def _md(**over):
+            return dataclasses.replace(md, **{k: v for k, v in over.items() if k in fields})
+
+        outs = []
+        if R > 0:
+            fb_p = types.SimpleNamespace(
+                forward_mode=ForwardMode.EXTEND,
+                spec_info=None,
+                extend_prefix_lens=forward_batch.extend_prefix_lens[:R],
+                extend_seq_lens_cpu=(
+                    list(forward_batch.extend_seq_lens_cpu[:R])
+                    if forward_batch.extend_seq_lens_cpu is not None
+                    else None
+                ),
+            )
+            md_p = _md(
+                query_start_loc=md.query_start_loc[: R + 1],
+                mamba_cache_indices=md.mamba_cache_indices[:R],
+            )
+            outs.append(
+                self._forward_extend_impl(
+                    layer, fb_p, mixed_qkv[:P], a[:P], b[:P], md_p, **kw
+                )
+            )
+        if n_tail > 0:
+            fb_v = types.SimpleNamespace(
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                spec_info=types.SimpleNamespace(draft_token_num=B, ragged_verify_layout=None),
+                extend_prefix_lens=None,
+                extend_seq_lens_cpu=None,
+            )
+            qsl = torch.arange(
+                0, T_tail + 1, B, dtype=md.query_start_loc.dtype, device=md.query_start_loc.device
+            )
+            md_v = _md(
+                query_start_loc=qsl,
+                mamba_cache_indices=md.mamba_cache_indices[R : R + n_tail],
+                has_mamba_track_mask=False,
+                track_conv_indices=None,
+                conv_states_mask_indices=None,
+                mamba_track_mask_indices=None,
+                retrieve_next_token=None,
+                retrieve_next_sibling=None,
+                retrieve_parent_token=None,
+                state_checkpoint_cu_starts=None,
+                num_state_checkpoints=0,
+                state_checkpoint_every_n_tokens=0,
+            )
+            outs.append(
+                self._forward_extend_impl(
+                    layer, fb_v, mixed_qkv[P:], a[P:], b[P:], md_v, **kw
+                )
+            )
+        out = outs[0] if len(outs) == 1 else torch.cat(outs, dim=1)
+        return out
+
+    def _forward_extend_impl(
+        self,
+        layer: RadixLinearAttention,
+        forward_batch,
+        mixed_qkv: Union[torch.Tensor, Tuple[torch.Tensor, ...]],
+        a: torch.Tensor,
+        b: torch.Tensor,
+        forward_metadata=None,
+        **kwargs,
+    ):
         assert isinstance(mixed_qkv, torch.Tensor)
         seq_len = mixed_qkv.shape[0]
 
@@ -707,7 +813,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
             return mixed_qkv.new_zeros((1, 0, layer.num_v_heads, layer.head_v_dim))
 
         is_target_verify = forward_batch.forward_mode.is_target_verify()
-        forward_metadata = self.forward_metadata
+        if forward_metadata is None:
+            forward_metadata = self.forward_metadata
 
         query_start_loc = forward_metadata.query_start_loc
         cache_indices = forward_metadata.mamba_cache_indices
