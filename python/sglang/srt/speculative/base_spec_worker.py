@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
@@ -12,6 +14,8 @@ from sglang.srt.model_executor.graph_memory_usage import (
     merge_graph_time_usage,
 )
 from sglang.srt.runtime_context import get_disagg, get_exec, get_memory, get_schedule
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.io_struct import (
@@ -253,6 +257,18 @@ class BaseSpecWorker(ABC):
 
         draft_runners = self._draft_model_runners()
         if not draft_runners:
+            return HiCacheDraftPlan()
+        if getattr(self, "use_draft_ring_pool", False):
+            # The DFLASH draft ring pool holds one fixed `window + block` region
+            # per request slot; it is not a mirror of the target pool, so it
+            # must not be addressed with target token indices by the host
+            # transfers. Leave the drafter out of HiCache: a prefix resumed
+            # from host starts with an empty draft ring, which verification
+            # already tolerates.
+            logger.info(
+                "HiCache draft plan: DFLASH draft ring pool active, drafter KV "
+                "is not offloaded."
+            )
             return HiCacheDraftPlan()
         draft_pools = tuple(runner.token_to_kv_pool for runner in draft_runners)
         if (
