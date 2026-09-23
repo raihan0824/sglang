@@ -11,7 +11,10 @@ use serde_json::json;
 use smg::config::{RetryConfig, RouterConfig};
 use tower::ServiceExt;
 
-use crate::common::{AppTestContext, TestRouterConfig, TestWorkerConfig};
+use crate::common::{
+    mock_worker::{clear_fail_status_code, set_fail_status_code},
+    AppTestContext, TestRouterConfig, TestWorkerConfig,
+};
 
 #[cfg(test)]
 mod retry_tests {
@@ -209,6 +212,98 @@ mod retry_tests {
             "Should succeed by retrying until finding healthy worker"
         );
 
+        ctx.shutdown().await;
+    }
+
+    fn cache_aware_with_retry(port: u16, max_retries: u32) -> RouterConfig {
+        RouterConfig::builder()
+            .regular_mode(vec![])
+            .cache_aware_policy(0.5, 32, 1.5, 60, 1000)
+            .host("127.0.0.1")
+            .port(port)
+            .max_payload_size(256 * 1024 * 1024)
+            .request_timeout_secs(600)
+            .worker_startup_timeout_secs(5)
+            .worker_startup_check_interval_secs(1)
+            .max_concurrent_requests(64)
+            .queue_timeout_secs(60)
+            .retry_config(RetryConfig {
+                max_retries,
+                initial_backoff_ms: 10,
+                max_backoff_ms: 50,
+                ..Default::default()
+            })
+            .build_unchecked()
+    }
+
+    fn generate_request(text: String) -> Request<Body> {
+        let payload = json!({ "text": text, "stream": false });
+        Request::builder()
+            .method("POST")
+            .uri("/generate")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap()
+    }
+
+    /// A retry after a 429 goes to another worker. A prefix-affinity policy sends
+    /// the same text to the same worker, so without that exclusion the retry of a
+    /// request whose worker has a full queue gets the same 429 again.
+    #[tokio::test]
+    async fn test_retry_after_429_goes_to_another_worker() {
+        let full_queue_port = 19650;
+        set_fail_status_code(full_queue_port, 429);
+
+        let ctx = AppTestContext::new_with_config(
+            cache_aware_with_retry(3304, 2), // two attempts: the first worker, then one other
+            vec![
+                TestWorkerConfig::flaky(full_queue_port, 1.0), // always 429
+                TestWorkerConfig::healthy(19651),
+            ],
+        )
+        .await;
+        let app = ctx.create_app().await;
+
+        // Distinct texts, so the policy places some of them on the full worker first.
+        for i in 0..10 {
+            let text = format!("request {i}: {}", "x".repeat(40 + i));
+            let resp = app.clone().oneshot(generate_request(text)).await.unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::OK,
+                "request {i} should be retried on the worker that has room"
+            );
+        }
+
+        clear_fail_status_code(full_queue_port);
+        ctx.shutdown().await;
+    }
+
+    /// With no other worker left, the retry still goes to the worker that failed
+    /// instead of failing with "no available workers".
+    #[tokio::test]
+    async fn test_retry_exclusion_falls_back_to_the_only_worker() {
+        let full_queue_port = 19652;
+        set_fail_status_code(full_queue_port, 429);
+
+        let ctx = AppTestContext::new_with_config(
+            cache_aware_with_retry(3305, 2),
+            vec![TestWorkerConfig::flaky(full_queue_port, 1.0)], // always 429
+        )
+        .await;
+        let app = ctx.create_app().await;
+
+        let resp = app
+            .oneshot(generate_request("only worker is full".to_string()))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "the client should get the worker's 429, not a 503"
+        );
+
+        clear_fail_status_code(full_queue_port);
         ctx.shutdown().await;
     }
 }

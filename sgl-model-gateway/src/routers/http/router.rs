@@ -140,6 +140,7 @@ impl Router {
         model_id: Option<&str>,
         text: Option<&str>,
         headers: Option<&HeaderMap>,
+        exclude_urls: &[String],
     ) -> Option<(Arc<dyn Worker>, i64)> {
         let effective_model_id = if !self.enable_igw { None } else { model_id };
 
@@ -152,13 +153,26 @@ impl Router {
             false, // get all workers, we'll filter by is_available() next
         );
 
-        let available: Vec<Arc<dyn Worker>> = workers
+        let mut available: Vec<Arc<dyn Worker>> = workers
             .iter()
             .filter(|w| w.is_available())
             .cloned()
             .collect();
         if available.is_empty() {
             return None;
+        }
+
+        // A retry skips the workers that already failed this request (e.g. a
+        // full queue answering 429), unless that would leave nobody to try.
+        if !exclude_urls.is_empty() {
+            let others: Vec<Arc<dyn Worker>> = available
+                .iter()
+                .filter(|w| !exclude_urls.iter().any(|url| url == w.url()))
+                .cloned()
+                .collect();
+            if !others.is_empty() {
+                available = others;
+            }
         }
 
         // Get the appropriate policy for this model
@@ -221,12 +235,27 @@ impl Router {
             bool_to_static_str(is_stream),
         );
 
+        // Workers that answered this request with a retryable status; the next
+        // attempt goes elsewhere when it can. Prefix-affinity policies would
+        // otherwise pick the same worker again, so a retry of a 429 from a full
+        // queue just hits the same full queue.
+        let failed_worker_urls: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
         let response = RetryExecutor::execute_response_with_retry(
             &self.retry_config,
             // operation per attempt
             |_: u32| async {
-                let res = self
-                    .route_typed_request_once(headers, typed_req, route, model_id, is_stream, &text)
+                let exclude_urls = failed_worker_urls.lock().unwrap().clone();
+                let (res, worker_url) = self
+                    .route_typed_request_once(
+                        headers,
+                        typed_req,
+                        route,
+                        model_id,
+                        is_stream,
+                        &text,
+                        &exclude_urls,
+                    )
                     .await;
 
                 // Need to be outside `route_typed_request_once` because that function has multiple return paths
@@ -235,6 +264,12 @@ impl Router {
                     res.status().as_u16(),
                     extract_error_code_from_response(&res),
                 );
+
+                if is_retryable_status(res.status()) {
+                    if let Some(url) = worker_url {
+                        failed_worker_urls.lock().unwrap().push(url);
+                    }
+                }
 
                 res
             },
@@ -277,6 +312,9 @@ impl Router {
         response
     }
 
+    /// One routing attempt. Returns the response and the URL of the worker it
+    /// went to (None when no worker could be selected).
+    #[allow(clippy::too_many_arguments)]
     async fn route_typed_request_once<T: GenerationRequest + serde::Serialize + Clone>(
         &self,
         headers: Option<&HeaderMap>,
@@ -285,16 +323,20 @@ impl Router {
         model_id: Option<&str>,
         is_stream: bool,
         text: &str,
-    ) -> Response {
+        exclude_urls: &[String],
+    ) -> (Response, Option<String>) {
         let (worker, reserved_prefill_tokens) = match self
-            .select_worker_for_model(model_id, Some(text), headers)
+            .select_worker_for_model(model_id, Some(text), headers, exclude_urls)
             .await
         {
             Some(selected) => selected,
             None => {
-                return error::service_unavailable(
-                    "no_available_workers",
-                    "No available workers (all circuits open or unhealthy)",
+                return (
+                    error::service_unavailable(
+                        "no_available_workers",
+                        "No available workers (all circuits open or unhealthy)",
+                    ),
+                    None,
                 );
             }
         };
@@ -355,7 +397,7 @@ impl Router {
             );
         }
 
-        response
+        (response, Some(worker.url().to_string()))
     }
 
     // Helper: return base worker URL (strips DP suffix when enabled)
