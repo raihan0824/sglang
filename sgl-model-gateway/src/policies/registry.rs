@@ -11,7 +11,7 @@ use tracing::{debug, info, warn};
 /// When the first worker of a new model is added, it determines the policy for that model.
 /// All subsequent workers of the same model use the established policy.
 /// When the last worker of a model is removed, the policy mapping is cleaned up.
-use super::{BucketPolicy, CacheAwarePolicy, LoadBalancingPolicy, PolicyFactory};
+use super::{BucketPolicy, CacheAwarePolicy, ChunkAwarePolicy, LoadBalancingPolicy, PolicyFactory};
 use crate::{config::types::PolicyConfig, core::Worker};
 
 /// Registry for managing model-to-policy mappings
@@ -323,6 +323,12 @@ impl PolicyRegistry {
                     );
                     cache_aware.init_workers(workers);
                 }
+            } else if policy.name() == "chunk_aware" {
+                // chunk_aware keeps the same per-pool prefix trees; seed them here too so
+                // registration and removal (below) reach it, not only lazy creation.
+                if let Some(chunk_aware) = policy.as_any().downcast_ref::<ChunkAwarePolicy>() {
+                    chunk_aware.init_workers(workers);
+                }
             }
         }
     }
@@ -339,6 +345,12 @@ impl PolicyRegistry {
                         "Removed worker {} from cache-aware policy for model {}",
                         worker_url, model_id
                     );
+                }
+            } else if policy.name() == "chunk_aware" {
+                // Without this a removed worker's tenant (and its whole prefix history) stays in
+                // the tree forever; on k8s every pod restart is a new URL, so it grows per restart.
+                if let Some(chunk_aware) = policy.as_any().downcast_ref::<ChunkAwarePolicy>() {
+                    chunk_aware.remove_worker_by_url(worker_url);
                 }
             }
         }
@@ -535,6 +547,69 @@ mod tests {
         registry.on_worker_removed("llama-3");
         assert!(registry.get_policy("llama-3").is_none());
         assert_eq!(registry.get_worker_counts().get("llama-3"), None);
+    }
+
+    /// The worker-registration steps must reach chunk_aware's prefix trees: a removed
+    /// worker loses its affinity credit instead of keeping its tenant forever.
+    #[tokio::test]
+    async fn chunk_aware_trees_follow_worker_removal() {
+        use std::collections::HashMap;
+
+        use crate::{
+            core::{BasicWorkerBuilder, WorkerType},
+            policies::{PrefillLoadReport, SelectWorkerInfo},
+        };
+
+        let registry = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        let policy = registry.on_worker_added("m", Some("chunk_aware"));
+        assert_eq!(policy.name(), "chunk_aware");
+        let workers: Vec<Arc<dyn Worker>> = ["http://w1:8000", "http://w2:8000"]
+            .iter()
+            .map(|url| {
+                Arc::new(
+                    BasicWorkerBuilder::new(*url)
+                        .worker_type(WorkerType::Regular)
+                        .build(),
+                ) as Arc<dyn Worker>
+            })
+            .collect();
+        registry.init_cache_aware_policy("m", &workers);
+
+        let loads = |w1: i64, w2: i64| -> HashMap<String, PrefillLoadReport> {
+            [("http://w1:8000", w1), ("http://w2:8000", w2)]
+                .iter()
+                .map(|(url, waiting)| {
+                    (
+                        (*url).to_string(),
+                        PrefillLoadReport {
+                            waiting_uncached_tokens: *waiting,
+                            running_reqs: 0,
+                            total_prefill_uncached_tokens: None,
+                            total_prefill_busy_us: None,
+                        },
+                    )
+                })
+                .collect()
+        };
+        // ~10k estimated tokens: above the default 8192-token affinity gate.
+        let text = "shared-prefix-".repeat(3000);
+        let info = SelectWorkerInfo {
+            request_text: Some(&text),
+            ..Default::default()
+        };
+
+        policy.update_prefill_loads(&[], &loads(0, 8192));
+        assert_eq!(policy.select_worker(&workers, &info).await, Some(0));
+
+        // w1 holds the prefix, so a small backlog deficit still routes to it...
+        policy.update_prefill_loads(&[], &loads(1000, 0));
+        assert_eq!(policy.select_worker(&workers, &info).await, Some(0));
+
+        // ...until the registry removes w1, which must drop its tenant from the tree. Removal
+        // also forgets w1's load report, so re-deliver the poll to isolate the tree.
+        registry.remove_worker_from_cache_aware("m", "http://w1:8000");
+        policy.update_prefill_loads(&[], &loads(1000, 0));
+        assert_eq!(policy.select_worker(&workers, &info).await, Some(1));
     }
 
     #[tokio::test]

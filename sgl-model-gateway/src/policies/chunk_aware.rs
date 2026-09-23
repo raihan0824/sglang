@@ -72,7 +72,7 @@ use std::{
 
 use async_trait::async_trait;
 use dashmap::DashMap;
-use tracing::{debug, warn};
+use tracing::debug;
 
 use super::{
     get_healthy_worker_indices, normalize_model_key, tree::Tree, utils::PeriodicTask,
@@ -413,15 +413,19 @@ impl LoadBalancingPolicy for ChunkAwarePolicy {
         let input_chars = text.chars().count();
         let est_tokens = self.chars_to_tokens(input_chars);
 
+        // Nothing in the router seeds `self.trees`: the registry initializes trees for
+        // cache_aware only, so neither static --worker-urls nor service discovery ever
+        // reaches `init_workers` here. Without a tree no prefix is ever recorded and
+        // every request routes on load and backlog alone. Create the pool tree on
+        // first use; matching is per worker url, so no tenant seeding is needed.
         let tree_key = tree_key_for_worker(workers[healthy_indices[0]].as_ref());
-        let tree = self.trees.get(&tree_key).map(|e| e.value().clone());
-        if tree.is_none() && !text.is_empty() {
-            warn!(
-                "chunk_aware: no tree for key '{}'; routing on load and backlog only \
-                 until the pool tree is seeded",
-                tree_key
-            );
-        }
+        let tree = Some(
+            self.trees
+                .entry(tree_key)
+                .or_insert_with(|| Arc::new(Tree::new()))
+                .value()
+                .clone(),
+        );
 
         let candidates =
             self.build_candidates(workers, &healthy_indices, tree.as_ref(), text, est_tokens);
@@ -676,6 +680,27 @@ mod tests {
         assert_eq!(
             second, 0,
             "prefix holder should win a backlog deficit smaller than the credit's reach"
+        );
+    }
+
+    /// The router never calls `init_workers` for chunk_aware (the registry seeds
+    /// cache_aware trees only), so affinity must work on a policy that was never
+    /// seeded: the first request creates the pool tree and records its prefix.
+    #[tokio::test]
+    async fn affinity_works_without_init_workers() {
+        let policy = policy_with(ChunkAwareConfig::default());
+        let workers = workers(&[W1, W2]);
+
+        let text = long_text("shared-prefix-");
+        set_loads(&policy, &[(W1, report(0, 0)), (W2, report(8192, 0))]);
+        let first = policy.select_worker(&workers, &info(&text)).await.unwrap();
+        assert_eq!(first, 0, "first request should land on the idle worker");
+
+        set_loads(&policy, &[(W1, report(1000, 0)), (W2, report(0, 0))]);
+        let second = policy.select_worker(&workers, &info(&text)).await.unwrap();
+        assert_eq!(
+            second, 0,
+            "an unseeded policy must still credit the worker that holds the prefix"
         );
     }
 
