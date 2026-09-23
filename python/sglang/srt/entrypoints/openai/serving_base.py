@@ -118,8 +118,18 @@ class OpenAIServingBase(ABC):
                     adapted_request, processed_request, raw_request
                 )
         except HTTPException as e:
+            # Forward the exception's headers: a queue-full 429 from the tokenizer
+            # manager carries Retry-After: 0, which is lost if the response is rebuilt
+            # from status and detail alone.
             return self.create_error_response(
-                message=e.detail, err_type=str(e.status_code), status_code=e.status_code
+                message=e.detail,
+                err_type=(
+                    "rate_limit_error"
+                    if e.status_code == HTTPStatus.TOO_MANY_REQUESTS
+                    else str(e.status_code)
+                ),
+                status_code=e.status_code,
+                headers=e.headers,
             )
         except ValueError as e:
             return self.create_error_response(
