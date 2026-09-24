@@ -37,7 +37,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum, auto
 from functools import lru_cache
-from typing import TYPE_CHECKING, Dict, List, Optional, Set, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple, Union
 
 import torch
 
@@ -604,6 +604,50 @@ class SchedulePolicy:
             logger.info(f"waiting_keys_after={waiting_keys_after}")
 
 
+# The system block of a DeepSeek chat prompt ends right before this token.
+_USER_TURN_TOKEN = "<｜User｜>"
+# The search for the first user turn stops here; checkpoints past it are dropped.
+_SYSTEM_BLOCK_SCAN_TOKENS = 65536
+
+
+def resolve_system_prompt_checkpoint_token_id(tokenizer: Any) -> Optional[int]:
+    """Id of the token that opens the first user turn, or None to keep checkpoints off."""
+    if not envs.SGLANG_ENABLE_SYSTEM_PROMPT_CHECKPOINT.get() or tokenizer is None:
+        return None
+    try:
+        token_id = tokenizer.convert_tokens_to_ids(_USER_TURN_TOKEN)
+        unk_token_id = tokenizer.unk_token_id
+    except Exception:
+        logger.exception("System prompt checkpoints stay off: token lookup failed.")
+        return None
+    if not isinstance(token_id, int) or token_id == unk_token_id:
+        logger.warning(
+            "System prompt checkpoints stay off: the tokenizer has no %s token.",
+            _USER_TURN_TOKEN,
+        )
+        return None
+    logger.info("System prompt checkpoints on (%s = token %d).", _USER_TURN_TOKEN, token_id)
+    return token_id
+
+
+def system_prompt_checkpoints(
+    input_ids: Any, user_turn_token_id: int, page_size: int, early_tokens: int
+) -> Tuple[int, ...]:
+    """Page-aligned prefix lengths that end a prefill chunk: an early point inside the
+    leading system block and the end of the block (the token before the first user turn).
+    Empty when the prompt has no system block."""
+    try:
+        scan_end = min(len(input_ids), _SYSTEM_BLOCK_SCAN_TOKENS)
+        block_end = input_ids.index(user_turn_token_id, 0, scan_end)
+    except Exception:  # no user turn in range, or ids that are not a list/array
+        return ()
+    end = block_end // page_size * page_size
+    early = early_tokens // page_size * page_size
+    if end <= 0:
+        return ()
+    return (early, end) if 0 < early < end else (end,)
+
+
 class AddReqResult(Enum):
     CONTINUE = auto()  # Continue to add requests
     NO_TOKEN = auto()  # No token left
@@ -616,6 +660,8 @@ class _PrefillAdmission:
     extend_len: int
     max_new_tokens: int
     is_chunked: bool
+    # The chunk ends early at a system prompt checkpoint: close the batch after it.
+    checkpoint_cut: bool = False
 
 
 class PrefillAdder:
@@ -637,9 +683,14 @@ class PrefillAdder:
         dllm_config: Optional[DllmConfig] = None,
         waiting_queue_len: int = 0,
         prefill_tile_block_m: int = 64,
+        system_prompt_checkpoint_token_id: Optional[int] = None,
     ):
         self.page_size = page_size
         self.prefill_tile_block_m = prefill_tile_block_m
+        self.system_prompt_checkpoint_token_id = system_prompt_checkpoint_token_id
+        self.system_prompt_checkpoint_early_tokens = (
+            envs.SGLANG_SYSTEM_PROMPT_CHECKPOINT_EARLY_TOKENS.get()
+        )
         self.tree_cache = tree_cache
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.running_batch = running_batch
@@ -1111,6 +1162,28 @@ class PrefillAdder:
             else AddReqResult.CONTINUE
         )
 
+    def _system_prompt_checkpoint_cut(
+        self, req: Req, prefix_len: int, extend_len: int
+    ) -> Optional[int]:
+        """Extend length that ends this chunk at the next system prompt checkpoint, or
+        None when none lies at least a page past the prefix and a page before the end
+        (the prompt's own cached end already covers a checkpoint in its last page)."""
+        if self.system_prompt_checkpoint_token_id is None or self.dllm_config is not None:
+            return None
+        if req.system_prompt_checkpoints is None:
+            req.system_prompt_checkpoints = system_prompt_checkpoints(
+                req.origin_input_ids,
+                self.system_prompt_checkpoint_token_id,
+                self.page_size,
+                self.system_prompt_checkpoint_early_tokens,
+            )
+        for point in req.system_prompt_checkpoints:
+            cut = point - prefix_len
+            if cut < self.page_size:
+                continue
+            return cut if cut <= extend_len - self.page_size else None
+        return None
+
     def add_chunked_req(self, req: Req):
         if self.dllm_config is not None:
             _rem_tokens = self._get_dllm_remain_tokens(req)
@@ -1156,6 +1229,14 @@ class PrefillAdder:
             return req
         truncated = cand_extend_input_len > _rem_tokens
         new_len = min(cand_extend_input_len, _rem_tokens)
+        checkpoint_cut = self._system_prompt_checkpoint_cut(
+            req, len(req.prefix_indices), cand_extend_input_len
+        )
+        if checkpoint_cut is not None and checkpoint_cut < new_len:
+            new_len = checkpoint_cut
+            truncated = True
+        else:
+            checkpoint_cut = None
         # The continuing chunk must fit. Keep reservation outside assert for -O.
         reserved = self._kv_shard_reserve_scratch(
             prefix_len=len(req.prefix_indices), extend_len=new_len
@@ -1177,6 +1258,10 @@ class PrefillAdder:
             is_chunked_continuation=True,
             compute_charge=req.extend_range.length if self.exact_chunk_fill else None,
         )
+        if checkpoint_cut is not None:
+            # The chunk stops short of the budget; close the batch so no new
+            # request becomes a second chunked request next to this one.
+            self.rem_chunk_tokens = 0
 
         # Return if chunked prefill not finished
         return req if truncated else None
@@ -1434,7 +1519,11 @@ class PrefillAdder:
                             req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS
                         )
                     admission = _PrefillAdmission(
-                        prefix_len, extend_len, max_new_tokens, is_chunked
+                        prefix_len,
+                        extend_len,
+                        max_new_tokens,
+                        is_chunked,
+                        admission.checkpoint_cut and is_chunked,
                     )
                 elif req.host_loaded_length < promised_host_hit:
                     # No FULL was loaded; recomputation may no longer fit.
@@ -1458,6 +1547,10 @@ class PrefillAdder:
                 return AddReqResult.OTHER
 
             self._commit_prefill_admission(req, admission, mamba_gap_reserve)
+            if admission.checkpoint_cut:
+                # The budget is not used up, but the batch now holds the
+                # chunked request: add nothing after it.
+                return AddReqResult.OTHER
 
         # This verdict controls the next candidate, not the committed request.
         return self.budget_state()
@@ -1488,6 +1581,25 @@ class PrefillAdder:
         )
         if not can_admit:
             return AddReqResult.NO_TOKEN
+
+        # End this request's chunk at a system prompt checkpoint. Only one
+        # chunked request may exist, so not while another one is running.
+        checkpoint_cut = None
+        if (
+            self.dllm_config is None
+            and chunk_tokens_limit is not None
+            and chunk_tokens_limit > 0
+            and truncation_align_size is None
+            and not has_chunked_req
+            and self.new_chunked_req is None
+        ):
+            checkpoint_cut = self._system_prompt_checkpoint_cut(
+                req, prefix_len, extend_len
+            )
+            if checkpoint_cut is not None and checkpoint_cut < chunk_tokens_limit:
+                chunk_tokens_limit = checkpoint_cut
+            else:
+                checkpoint_cut = None
 
         # Without chunking, allow the first request even above the input cap.
         if (
@@ -1543,7 +1655,13 @@ class PrefillAdder:
         if (verdict := self._check_prefill_tile_budget(tile_tokens)) is not None:
             return verdict
 
-        return _PrefillAdmission(prefix_len, extend_len, max_new_tokens, is_chunked)
+        return _PrefillAdmission(
+            prefix_len,
+            extend_len,
+            max_new_tokens,
+            is_chunked,
+            checkpoint_cut is not None and is_chunked,
+        )
 
     def _commit_prefill_admission(
         self, req: Req, admission: _PrefillAdmission, mamba_gap_reserve: int

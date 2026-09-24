@@ -675,6 +675,14 @@ class Envs:
     # (auto-enabled for GLM-5.2-style DSA); set True to A/B synchronous swap-in.
     SGLANG_DISABLE_HISPARSE_PREFETCH = EnvBool(False)
     SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS = EnvBool(True)
+    # End a prefill chunk at the end of the leading system block (DeepSeek chat
+    # format: the token before the first <｜User｜>) and at an early point inside
+    # it. A sliding-window prefix is reusable only where the cache kept its last
+    # window, so without the cut a new conversation that shares only the system
+    # prompt gets no prefix hit.
+    SGLANG_ENABLE_SYSTEM_PROMPT_CHECKPOINT = EnvBool(False)
+    # Early cut inside a long system block, in tokens; 0 keeps only the block end.
+    SGLANG_SYSTEM_PROMPT_CHECKPOINT_EARLY_TOKENS = EnvInt(2048)
     # Decode batches between SWA out-of-window evictions.
     SGLANG_SWA_EVICTION_INTERVAL = EnvInt(128)
     # The tree-core registry falls back to Python for:

@@ -220,6 +220,7 @@ from sglang.srt.managers.schedule_policy import (
     AddReqResult,
     PrefillAdder,
     SchedulePolicy,
+    resolve_system_prompt_checkpoint_token_id,
 )
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
@@ -890,6 +891,9 @@ class Scheduler(
                     revision=get_model().revision,
                     tokenizer_backend=get_serving().tokenizer_backend,
                 )
+        self.system_prompt_checkpoint_token_id = (
+            resolve_system_prompt_checkpoint_token_id(self.tokenizer)
+        )
 
         # Load multimodal processor for M-RoPE fallback computation.
         self._mm_processor = None
@@ -3949,6 +3953,7 @@ class Scheduler(
             dllm_config=self.dllm_config,
             waiting_queue_len=len(self.waiting_queue),
             prefill_tile_block_m=prefill_tile_block_m,
+            system_prompt_checkpoint_token_id=self.system_prompt_checkpoint_token_id,
         )
 
         if self.chunked_req is not None:

@@ -1185,6 +1185,9 @@ class Req(ReqDllmMixin):
         # match, it will be the tracked seqlen in the ping pong buffer for the
         # right prefill pass.
         self.mamba_branching_seqlen: Optional[int] = None
+        # Page-aligned prefix lengths where a prefill chunk ends so the system
+        # prompt stays reusable (see PrefillAdder); None until first admission.
+        self.system_prompt_checkpoints: Optional[Tuple[int, ...]] = None
         # Total cached prefix length (on-device prefix_indices + host_hit_length),
         # capped at the max allowed prefix. Set during prefix matching at schedule
         # time and used to estimate uncached tokens / sort by longest prefix for
