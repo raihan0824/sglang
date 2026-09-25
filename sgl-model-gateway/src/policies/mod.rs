@@ -80,6 +80,13 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
         // Default: no-op for stateless policies
     }
 
+    /// The worker did not take a request the policy had already recorded on
+    /// it (a full queue answering 429, a send error). Policies with a prefix
+    /// tree drop that record beyond `matched_chars`, what the worker had
+    /// matched before the record was made, so a client's retry is not routed
+    /// as "cached" to a worker that never saw the request. Default: no-op.
+    fn on_request_refused(&self, _worker_url: &str, _text: &str, _matched_chars: usize) {}
+
     /// Whether this policy needs the `LoadMonitor` to poll worker load.
     ///
     /// The monitor skips the whole fetch when no registered policy wants it.
@@ -147,6 +154,8 @@ pub struct WorkerSelection {
     /// Share (0.0-1.0) of the request text the chosen worker had already seen
     /// according to the policy's prefix tree. 0.0 for policies without one.
     pub prefix_match: f32,
+    /// The same match in characters, for `on_request_refused`.
+    pub matched_chars: usize,
 }
 
 impl WorkerSelection {
@@ -156,6 +165,7 @@ impl WorkerSelection {
             index,
             reserved_prefill_tokens: 0,
             prefix_match: 0.0,
+            matched_chars: 0,
         }
     }
 }

@@ -509,6 +509,7 @@ impl LoadBalancingPolicy for ChunkAwarePolicy {
             } else {
                 0.0
             },
+            matched_chars: chosen.matched_chars.min(input_chars),
         })
     }
 
@@ -518,6 +519,21 @@ impl LoadBalancingPolicy for ChunkAwarePolicy {
 
     fn needs_request_text(&self) -> bool {
         true
+    }
+
+    /// `select_worker_detailed` records the text on the chosen worker before
+    /// the worker has seen it, so a refusal must take that record back;
+    /// otherwise a client's retry of a cold refused request looks fully
+    /// cached on the worker that refused it and is pinned there.
+    fn on_request_refused(&self, worker_url: &str, text: &str, matched_chars: usize) {
+        if text.is_empty() {
+            return;
+        }
+        for tree_ref in self.trees.iter() {
+            tree_ref
+                .value()
+                .remove_tenant_beyond(text, worker_url, matched_chars);
+        }
     }
 
     fn needs_load_updates(&self) -> bool {
@@ -594,6 +610,58 @@ mod tests {
             eviction_interval_secs: 0,
             ..config
         })
+    }
+
+    #[tokio::test]
+    async fn refused_attempt_is_forgotten_beyond_the_prior_match() {
+        let policy = policy_with(ChunkAwareConfig {
+            long_prefill_threshold_tokens: 1,
+            min_cache_match_rate: 0.0,
+            ..ChunkAwareConfig::default()
+        });
+        let ws = workers(&[W1, W2]);
+        policy.init_workers(&ws);
+        let turn_one = "system prompt, turn one";
+        let first = policy
+            .select_worker_detailed(
+                &ws,
+                &SelectWorkerInfo {
+                    request_text: Some(turn_one),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let url = ws[first.index].url().to_string();
+        let tree = policy
+            .trees
+            .get(&tree_key_for_worker(ws[first.index].as_ref()))
+            .unwrap()
+            .clone();
+        assert_eq!(first.matched_chars, 0, "a cold request matches nothing");
+        assert_eq!(tree.prefix_match_tenant_count(turn_one, &url), turn_one.len());
+
+        // The worker refused it: it has seen none of it.
+        policy.on_request_refused(&url, turn_one, first.matched_chars);
+        assert_eq!(tree.prefix_match_tenant_count(turn_one, &url), 0);
+
+        // A follow-up refused on the worker that served turn one keeps turn one.
+        tree.insert(turn_one, &url);
+        let turn_two = "system prompt, turn one, turn two";
+        let second = policy
+            .select_worker_detailed(
+                &ws,
+                &SelectWorkerInfo {
+                    request_text: Some(turn_two),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(ws[second.index].url(), url, "affinity picks the worker with turn one");
+        assert_eq!(second.matched_chars, turn_one.len());
+        policy.on_request_refused(&url, turn_two, second.matched_chars);
+        assert_eq!(tree.prefix_match_tenant_count(turn_two, &url), turn_one.len());
     }
 
     fn report(waiting_uncached_tokens: i64, running_reqs: i64) -> PrefillLoadReport {

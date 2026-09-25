@@ -408,4 +408,45 @@ mod retry_tests {
         }
         ctx.shutdown().await;
     }
+
+    /// A refused attempt must not count as "seen" on the worker that refused
+    /// it. One worker always answers 429: a cold request refused there is
+    /// served by the other worker, and the client's retry of the same text must
+    /// go straight to the worker that served it. If the refusing worker kept
+    /// the record, the retry would look fully cached there, be pinned to it by
+    /// the affinity rule, and fail with the same 429 about half the time.
+    #[tokio::test]
+    async fn test_refused_attempt_is_not_remembered_as_seen() {
+        let full_port = 19655;
+        set_fail_status_code(full_port, 429);
+
+        let ctx = AppTestContext::new_with_config(
+            chunk_aware_with_affinity_retry(3307),
+            vec![
+                TestWorkerConfig::flaky(full_port, 1.0), // always 429
+                TestWorkerConfig::healthy(19656),
+            ],
+        )
+        .await;
+        let app = ctx.create_app().await;
+
+        for i in 0..12 {
+            let text = format!("conversation {i}: {}", "q".repeat(120 + i));
+            for turn in 0..2 {
+                let resp = app
+                    .clone()
+                    .oneshot(generate_request(text.clone()))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    resp.status(),
+                    StatusCode::OK,
+                    "conversation {i} send {turn} should be served by the worker with room"
+                );
+            }
+        }
+
+        clear_fail_status_code(full_port);
+        ctx.shutdown().await;
+    }
 }

@@ -903,6 +903,88 @@ impl Tree {
         self.tenant_char_count.remove(tenant_id.as_ref());
     }
 
+    /// Drop `tenant` from the part of `text`'s path past its first
+    /// `keep_chars` characters. Undoes an `insert` of `text` for a tenant that
+    /// then refused the request (a full queue answering 429): the worker never
+    /// saw the text, so a client's retry must not look cached there. What the
+    /// tenant had matched before that insert (`keep_chars`) stays, and so does
+    /// any node the tenant still needs for longer text of its own. Nodes left
+    /// with no tenant and no children are removed.
+    pub fn remove_tenant_beyond(&self, text: &str, tenant: &str, keep_chars: usize) {
+        let tenant_id = intern_tenant(tenant);
+
+        // Walk the path of `text` through nodes this tenant is on, collecting
+        // the nodes that start at or past `keep_chars`.
+        let mut remaining = text;
+        let mut offset = 0usize;
+        let mut prev = Arc::clone(&self.root);
+        let mut beyond: Vec<NodeRef> = Vec::new();
+        while !remaining.is_empty() {
+            let first_char = remaining.chars().next().unwrap();
+            let Some(node) = prev.children.get(&first_char).map(|e| e.value().clone()) else {
+                break;
+            };
+            if !node
+                .tenant_last_access_time
+                .contains_key(tenant_id.as_ref())
+            {
+                break;
+            }
+            let (node_chars, shared) = {
+                let guard = node.text.read().unwrap();
+                (
+                    guard.char_count(),
+                    shared_prefix_count(remaining, guard.as_str()),
+                )
+            };
+            if shared < node_chars {
+                // The path diverges inside this node: it carries text the
+                // request did not contain, so the tenant's claim on it comes
+                // from another request.
+                break;
+            }
+            if offset >= keep_chars {
+                beyond.push(Arc::clone(&node));
+            }
+            offset += node_chars;
+            remaining = advance_by_chars(remaining, node_chars);
+            prev = node;
+        }
+
+        // Unwind from the deepest node. A node with a child still on the
+        // tenant's path belongs to longer text of the tenant: keep it and
+        // everything above it.
+        for node in beyond.into_iter().rev() {
+            let has_child_with_tenant = node.children.iter().any(|child| {
+                child
+                    .value()
+                    .tenant_last_access_time
+                    .contains_key(tenant_id.as_ref())
+            });
+            if has_child_with_tenant {
+                break;
+            }
+            if node
+                .tenant_last_access_time
+                .remove(tenant_id.as_ref())
+                .is_some()
+            {
+                let node_len = node.text.read().unwrap().char_count();
+                self.tenant_char_count
+                    .entry(Arc::clone(&tenant_id))
+                    .and_modify(|count| *count = count.saturating_sub(node_len));
+            }
+            if node.children.is_empty() && node.tenant_last_access_time.is_empty() {
+                let parent_opt = node.parent.read().unwrap().clone();
+                if let Some(ref parent) = parent_opt {
+                    if let Some(fc) = node.text.read().unwrap().first_char() {
+                        parent.children.remove(&fc);
+                    }
+                }
+            }
+        }
+    }
+
     #[allow(dead_code)]
     pub fn get_tenant_char_count(&self) -> HashMap<String, usize> {
         self.tenant_char_count
@@ -1018,6 +1100,68 @@ mod tests {
             .iter()
             .map(|entry| (entry.key().to_string(), *entry.value()))
             .collect()
+    }
+
+    #[test]
+    fn test_remove_tenant_beyond() {
+        let tree = Tree::new();
+        tree.insert("", "x");
+        tree.insert("", "y");
+        let size = |tenant: &str| {
+            tree.get_used_size_per_tenant()
+                .get(tenant)
+                .copied()
+                .unwrap_or(0)
+        };
+        let maintained = |tenant: &str| {
+            get_maintained_counts(&tree)
+                .get(tenant)
+                .copied()
+                .unwrap_or(0)
+        };
+
+        // A cold request recorded on x and then refused there: x forgets all of it.
+        tree.insert("hello world", "x");
+        tree.remove_tenant_beyond("hello world", "x", 0);
+        assert_eq!(tree.prefix_match_tenant_count("hello world", "x"), 0);
+        assert_eq!(size("x"), 0);
+        assert_eq!(maintained("x"), 0);
+
+        // Another tenant on the same text is untouched and keeps the shared nodes.
+        tree.insert("hello world", "y");
+        tree.insert("hello world", "x");
+        tree.remove_tenant_beyond("hello world", "x", 0);
+        assert_eq!(tree.prefix_match_tenant_count("hello world", "y"), 11);
+        assert_eq!(tree.prefix_match_tenant_count("hello world", "x"), 0);
+        assert_eq!(size("y"), 11);
+
+        // A refused follow-up keeps the turn the tenant did serve and loses the new one.
+        tree.insert("hello world", "x");
+        let had = tree.prefix_match_tenant_count("hello world, again", "x");
+        assert_eq!(had, 11);
+        tree.insert("hello world, again", "x");
+        tree.remove_tenant_beyond("hello world, again", "x", had);
+        assert_eq!(tree.prefix_match_tenant_count("hello world, again", "x"), 11);
+        assert_eq!(tree.prefix_match_tenant_count("hello world", "x"), 11);
+        assert_eq!(size("x"), 11);
+        assert_eq!(maintained("x"), 11);
+
+        // Longer text of the tenant through the same nodes is not cut.
+        tree.insert("hello world, again and more", "x");
+        tree.remove_tenant_beyond("hello world, again", "x", 11);
+        assert_eq!(
+            tree.prefix_match_tenant_count("hello world, again and more", "x"),
+            27
+        );
+        assert_eq!(size("x"), 27);
+        assert_eq!(maintained("x"), 27);
+
+        // Nothing to drop when the tenant had matched all of it before.
+        tree.remove_tenant_beyond("hello world, again and more", "x", 27);
+        assert_eq!(
+            tree.prefix_match_tenant_count("hello world, again and more", "x"),
+            27
+        );
     }
 
     #[test]

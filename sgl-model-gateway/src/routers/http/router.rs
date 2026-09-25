@@ -23,7 +23,7 @@ use crate::{
         metrics::{bool_to_static_str, metrics_labels, Metrics},
         otel_trace::inject_trace_context_http,
     },
-    policies::{PolicyRegistry, SelectWorkerInfo},
+    policies::{PolicyRegistry, SelectWorkerInfo, WorkerSelection},
     protocols::{
         chat::ChatCompletionRequest,
         classify::ClassifyRequest,
@@ -42,6 +42,16 @@ use crate::{
         RouterTrait,
     },
 };
+
+/// The worker one routing attempt went to, with what the policy had
+/// matched of the request text there when it chose it.
+struct AttemptedWorker {
+    url: String,
+    /// Share (0.0-1.0) of the request text, for the affinity retry.
+    prefix_match: f32,
+    /// The same in characters, for `LoadBalancingPolicy::on_request_refused`.
+    matched_chars: usize,
+}
 
 /// Regular router that uses injected load balancing policies
 pub struct Router {
@@ -132,10 +142,10 @@ impl Router {
 
     /// Select worker for a specific model considering circuit breaker state.
     ///
-    /// Returns the worker, any prefill work the policy reserved for this
-    /// request (the caller must hand it to `WorkerLoadGuard` so the
-    /// reservation is released on the same path as the load counter), and the
-    /// share of the request text the policy matched on that worker.
+    /// Returns the worker and the policy's selection: any prefill work it
+    /// reserved for this request (the caller must hand it to `WorkerLoadGuard`
+    /// so the reservation is released on the same path as the load counter)
+    /// and how much of the request text it matched on that worker.
     async fn select_worker_for_model(
         &self,
         model_id: Option<&str>,
@@ -143,7 +153,7 @@ impl Router {
         headers: Option<&HeaderMap>,
         exclude_urls: &[String],
         pin_url: Option<&str>,
-    ) -> Option<(Arc<dyn Worker>, i64, f32)> {
+    ) -> Option<(Arc<dyn Worker>, WorkerSelection)> {
         let effective_model_id = if !self.enable_igw { None } else { model_id };
 
         // Get workers for the specified model O(1), filtered by connection mode
@@ -221,11 +231,7 @@ impl Router {
             policy.name(),
         );
 
-        Some((
-            available[selection.index].clone(),
-            selection.reserved_prefill_tokens,
-            selection.prefix_match,
-        ))
+        Some((available[selection.index].clone(), selection))
     }
 
     pub async fn route_typed_request<T: GenerationRequest + serde::Serialize + Clone>(
@@ -266,6 +272,10 @@ impl Router {
         let affinity_min_match = self.retry_config.affinity_min_match;
         let affinity_backoff =
             std::time::Duration::from_millis(self.retry_config.affinity_backoff_ms);
+        let policy = match model_id {
+            Some(model) => self.policy_registry.get_policy_or_default(model),
+            None => self.policy_registry.get_default_policy(),
+        };
 
         let response = RetryExecutor::execute_response_with_retry(
             &self.retry_config,
@@ -303,14 +313,17 @@ impl Router {
                 );
 
                 if is_retryable_status(res.status()) {
-                    if let Some((url, prefix_match)) = attempted {
+                    if let Some(attempt) = attempted {
+                        // The worker did not take it: the policy must not
+                        // remember the request as seen there.
+                        policy.on_request_refused(&attempt.url, &text, attempt.matched_chars);
                         let affinity = affinity_min_match > 0.0
-                            && prefix_match >= affinity_min_match
+                            && attempt.prefix_match >= affinity_min_match
                             && !affinity_retry_used.swap(true, std::sync::atomic::Ordering::Relaxed);
                         if affinity {
-                            *pin_next.lock().unwrap() = Some(url);
+                            *pin_next.lock().unwrap() = Some(attempt.url);
                         } else {
-                            failed_worker_urls.lock().unwrap().push(url);
+                            failed_worker_urls.lock().unwrap().push(attempt.url);
                         }
                     }
                 }
@@ -357,7 +370,7 @@ impl Router {
     }
 
     /// One routing attempt. Returns the response and, when a worker was
-    /// selected, its URL plus the share of the request text the policy had
+    /// selected, which one and how much of the request text the policy had
     /// matched on it (None when no worker could be selected).
     #[allow(clippy::too_many_arguments)]
     async fn route_typed_request_once<T: GenerationRequest + serde::Serialize + Clone>(
@@ -370,8 +383,8 @@ impl Router {
         text: &str,
         exclude_urls: &[String],
         pin_url: Option<&str>,
-    ) -> (Response, Option<(String, f32)>) {
-        let (worker, reserved_prefill_tokens, prefix_match) = match self
+    ) -> (Response, Option<AttemptedWorker>) {
+        let (worker, selection) = match self
             .select_worker_for_model(model_id, Some(text), headers, exclude_urls, pin_url)
             .await
         {
@@ -402,7 +415,7 @@ impl Router {
                 WorkerLoadGuard::with_prefill_reservation(
                     worker.clone(),
                     headers,
-                    reserved_prefill_tokens,
+                    selection.reserved_prefill_tokens,
                 )
             });
 
@@ -443,7 +456,14 @@ impl Router {
             );
         }
 
-        (response, Some((worker.url().to_string(), prefix_match)))
+        (
+            response,
+            Some(AttemptedWorker {
+                url: worker.url().to_string(),
+                prefix_match: selection.prefix_match,
+                matched_chars: selection.matched_chars,
+            }),
+        )
     }
 
     // Helper: return base worker URL (strips DP suffix when enabled)
