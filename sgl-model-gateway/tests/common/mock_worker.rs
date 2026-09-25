@@ -153,9 +153,10 @@ impl Drop for MockWorker {
 
 // Handler implementations
 
-/// Check if request should fail based on configured fail_rate
+/// Check if request should fail: a scripted failure (see [`set_fail_next`])
+/// first, then the configured fail_rate.
 async fn should_fail(config: &MockWorkerConfig) -> bool {
-    rand::random::<f32>() < config.fail_rate
+    take_scripted_failure(config.port) || rand::random::<f32>() < config.fail_rate
 }
 
 /// Pick the HTTP status used when `should_fail` triggers. Defaults to 500
@@ -1554,6 +1555,44 @@ pub fn clear_fail_status_code(port: u16) {
 fn get_fail_status_code_for_port(port: u16) -> Option<u16> {
     let map = get_fail_status_code_config().lock().unwrap();
     map.get(&port).copied()
+}
+
+// --- Scripted failures (for retry-placement tests) ---
+// When set for `port`, the next `n` `should_fail` checks on that worker fail
+// (with the status from `set_fail_status_code`, if any) and the configured
+// `fail_rate` applies again afterwards. Lets a test say "full for exactly one
+// request, then free" about a specific worker.
+
+static FAIL_NEXT: OnceLock<Mutex<HashMap<u16, usize>>> = OnceLock::new();
+
+fn get_fail_next_config() -> &'static Mutex<HashMap<u16, usize>> {
+    FAIL_NEXT.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Make the worker on `port` fail its next `n` requests, then behave normally.
+pub fn set_fail_next(port: u16, n: usize) {
+    get_fail_next_config().lock().unwrap().insert(port, n);
+}
+
+/// Scripted failures still pending on `port` (see [`set_fail_next`]).
+pub fn fail_next_remaining(port: u16) -> usize {
+    get_fail_next_config()
+        .lock()
+        .unwrap()
+        .get(&port)
+        .copied()
+        .unwrap_or(0)
+}
+
+fn take_scripted_failure(port: u16) -> bool {
+    let mut map = get_fail_next_config().lock().unwrap();
+    match map.get_mut(&port) {
+        Some(n) if *n > 0 => {
+            *n -= 1;
+            true
+        }
+        _ => false,
+    }
 }
 
 // --- Stream cancellation tracking (for upstream cancel tests) ---

@@ -2546,6 +2546,7 @@ mod upstream_cancel_tests {
                 max_backoff_ms: 50,
                 backoff_multiplier: 1.0,
                 jitter_factor: 0.0,
+                ..Default::default()
             },
         );
         let mut ctx =
@@ -2637,6 +2638,7 @@ mod upstream_cancel_tests {
                 max_backoff_ms: 50,
                 backoff_multiplier: 1.0,
                 jitter_factor: 0.0,
+                ..Default::default()
             })
             .build_unchecked();
         let mut ctx = AppTestContext::new_with_config(

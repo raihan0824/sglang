@@ -137,21 +137,25 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
 }
 
 /// A worker choice plus the side-effects the router must apply for it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct WorkerSelection {
     /// Index into the `workers` slice passed to the policy.
     pub index: usize,
     /// Uncached prefill tokens to reserve on the chosen worker until the
     /// response completes. 0 for policies that do not reserve.
     pub reserved_prefill_tokens: i64,
+    /// Share (0.0-1.0) of the request text the chosen worker had already seen
+    /// according to the policy's prefix tree. 0.0 for policies without one.
+    pub prefix_match: f32,
 }
 
 impl WorkerSelection {
-    /// A selection with no reservation.
+    /// A selection with no reservation and no known prefix match.
     pub fn at(index: usize) -> Self {
         Self {
             index,
             reserved_prefill_tokens: 0,
+            prefix_match: 0.0,
         }
     }
 }

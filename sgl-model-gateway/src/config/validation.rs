@@ -558,6 +558,13 @@ impl ConfigValidator {
                 reason: "Must be between 0.0 and 1.0".to_string(),
             });
         }
+        if !(0.0..=1.0).contains(&retry.affinity_min_match) {
+            return Err(ConfigError::InvalidValue {
+                field: "retry.affinity_min_match".to_string(),
+                value: retry.affinity_min_match.to_string(),
+                reason: "Must be between 0.0 and 1.0".to_string(),
+            });
+        }
         Ok(())
     }
 

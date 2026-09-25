@@ -9,7 +9,7 @@ use axum::{
 };
 use futures_util::{stream, StreamExt};
 use reqwest::Client;
-use tracing::{debug, error};
+use tracing::{debug, error, info};
 
 use crate::{
     app_context::AppContext,
@@ -132,16 +132,18 @@ impl Router {
 
     /// Select worker for a specific model considering circuit breaker state.
     ///
-    /// Returns the worker plus any prefill work the policy reserved for this
-    /// request, which the caller must hand to `WorkerLoadGuard` so the
-    /// reservation is released on the same path as the load counter.
+    /// Returns the worker, any prefill work the policy reserved for this
+    /// request (the caller must hand it to `WorkerLoadGuard` so the
+    /// reservation is released on the same path as the load counter), and the
+    /// share of the request text the policy matched on that worker.
     async fn select_worker_for_model(
         &self,
         model_id: Option<&str>,
         text: Option<&str>,
         headers: Option<&HeaderMap>,
         exclude_urls: &[String],
-    ) -> Option<(Arc<dyn Worker>, i64)> {
+        pin_url: Option<&str>,
+    ) -> Option<(Arc<dyn Worker>, i64, f32)> {
         let effective_model_id = if !self.enable_igw { None } else { model_id };
 
         // Get workers for the specified model O(1), filtered by connection mode
@@ -162,9 +164,22 @@ impl Router {
             return None;
         }
 
-        // A retry skips the workers that already failed this request (e.g. a
-        // full queue answering 429), unless that would leave nobody to try.
-        if !exclude_urls.is_empty() {
+        // An affinity retry goes back to the worker holding this request's
+        // cache, as long as it is still available. Any other retry skips the
+        // workers that already failed this request (e.g. a full queue
+        // answering 429), unless that would leave nobody to try.
+        let pinned: Vec<Arc<dyn Worker>> = pin_url
+            .map(|pin| {
+                available
+                    .iter()
+                    .filter(|w| w.url() == pin)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !pinned.is_empty() {
+            available = pinned;
+        } else if !exclude_urls.is_empty() {
             let others: Vec<Arc<dyn Worker>> = available
                 .iter()
                 .filter(|w| !exclude_urls.iter().any(|url| url == w.url()))
@@ -209,6 +224,7 @@ impl Router {
         Some((
             available[selection.index].clone(),
             selection.reserved_prefill_tokens,
+            selection.prefix_match,
         ))
     }
 
@@ -240,13 +256,33 @@ impl Router {
         // otherwise pick the same worker again, so a retry of a 429 from a full
         // queue just hits the same full queue.
         let failed_worker_urls: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+        // Exception: a worker that had most of this request's text cached gets
+        // the first retry back after a short wait (an affinity retry), so a
+        // conversation is not served cold elsewhere just because its replica
+        // was momentarily full. One affinity retry per request; if that one
+        // fails too, the worker is skipped like any other.
+        let pin_next: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+        let affinity_retry_used = std::sync::atomic::AtomicBool::new(false);
+        let affinity_min_match = self.retry_config.affinity_min_match;
+        let affinity_backoff =
+            std::time::Duration::from_millis(self.retry_config.affinity_backoff_ms);
 
         let response = RetryExecutor::execute_response_with_retry(
             &self.retry_config,
             // operation per attempt
             |_: u32| async {
+                let pin_url = pin_next.lock().unwrap().take();
+                if let Some(url) = pin_url.as_deref() {
+                    info!(
+                        worker = url,
+                        "Affinity retry: back to the worker holding this request's cache"
+                    );
+                    if !affinity_backoff.is_zero() {
+                        tokio::time::sleep(affinity_backoff).await;
+                    }
+                }
                 let exclude_urls = failed_worker_urls.lock().unwrap().clone();
-                let (res, worker_url) = self
+                let (res, attempted) = self
                     .route_typed_request_once(
                         headers,
                         typed_req,
@@ -255,6 +291,7 @@ impl Router {
                         is_stream,
                         &text,
                         &exclude_urls,
+                        pin_url.as_deref(),
                     )
                     .await;
 
@@ -266,8 +303,15 @@ impl Router {
                 );
 
                 if is_retryable_status(res.status()) {
-                    if let Some(url) = worker_url {
-                        failed_worker_urls.lock().unwrap().push(url);
+                    if let Some((url, prefix_match)) = attempted {
+                        let affinity = affinity_min_match > 0.0
+                            && prefix_match >= affinity_min_match
+                            && !affinity_retry_used.swap(true, std::sync::atomic::Ordering::Relaxed);
+                        if affinity {
+                            *pin_next.lock().unwrap() = Some(url);
+                        } else {
+                            failed_worker_urls.lock().unwrap().push(url);
+                        }
                     }
                 }
 
@@ -312,8 +356,9 @@ impl Router {
         response
     }
 
-    /// One routing attempt. Returns the response and the URL of the worker it
-    /// went to (None when no worker could be selected).
+    /// One routing attempt. Returns the response and, when a worker was
+    /// selected, its URL plus the share of the request text the policy had
+    /// matched on it (None when no worker could be selected).
     #[allow(clippy::too_many_arguments)]
     async fn route_typed_request_once<T: GenerationRequest + serde::Serialize + Clone>(
         &self,
@@ -324,9 +369,10 @@ impl Router {
         is_stream: bool,
         text: &str,
         exclude_urls: &[String],
-    ) -> (Response, Option<String>) {
-        let (worker, reserved_prefill_tokens) = match self
-            .select_worker_for_model(model_id, Some(text), headers, exclude_urls)
+        pin_url: Option<&str>,
+    ) -> (Response, Option<(String, f32)>) {
+        let (worker, reserved_prefill_tokens, prefix_match) = match self
+            .select_worker_for_model(model_id, Some(text), headers, exclude_urls, pin_url)
             .await
         {
             Some(selected) => selected,
@@ -397,7 +443,7 @@ impl Router {
             );
         }
 
-        (response, Some(worker.url().to_string()))
+        (response, Some((worker.url().to_string(), prefix_match)))
     }
 
     // Helper: return base worker URL (strips DP suffix when enabled)

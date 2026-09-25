@@ -504,6 +504,11 @@ impl LoadBalancingPolicy for ChunkAwarePolicy {
             // Rule 1: reserve only the *uncached* remainder — a matched prefix
             // costs no prefill.
             reserved_prefill_tokens: chosen.new_tokens,
+            prefix_match: if input_chars > 0 {
+                chosen.matched_chars.min(input_chars) as f32 / input_chars as f32
+            } else {
+                0.0
+            },
         })
     }
 

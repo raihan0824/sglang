@@ -414,6 +414,17 @@ struct CliArgs {
     #[arg(long, default_value_t = 0.2, help_heading = "Retry Configuration")]
     retry_jitter_factor: f32,
 
+    /// Retry the same worker (after --retry-affinity-backoff-ms) when it answered a
+    /// retryable status and the policy had matched at least this share (0.0-1.0) of
+    /// the request text on it; 0 disables. Keeps a conversation on the replica that
+    /// holds its cache instead of serving it cold elsewhere.
+    #[arg(long, default_value_t = 0.0, help_heading = "Retry Configuration")]
+    retry_affinity_min_match: f32,
+
+    /// Wait in milliseconds before an affinity retry, so the worker can free a slot
+    #[arg(long, default_value_t = 500, help_heading = "Retry Configuration")]
+    retry_affinity_backoff_ms: u64,
+
     /// Disable automatic retries
     #[arg(long, default_value_t = false, help_heading = "Retry Configuration")]
     disable_retries: bool,
@@ -1077,6 +1088,8 @@ impl CliArgs {
                 max_backoff_ms: self.retry_max_backoff_ms,
                 backoff_multiplier: self.retry_backoff_multiplier,
                 jitter_factor: self.retry_jitter_factor,
+                affinity_min_match: self.retry_affinity_min_match,
+                affinity_backoff_ms: self.retry_affinity_backoff_ms,
             })
             .circuit_breaker_config(CircuitBreakerConfig {
                 failure_threshold: self.cb_failure_threshold,

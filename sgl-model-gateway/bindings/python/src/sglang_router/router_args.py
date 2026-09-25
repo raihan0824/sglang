@@ -118,6 +118,8 @@ class RouterArgs:
     retry_max_backoff_ms: int = 30_000
     retry_backoff_multiplier: float = 1.5
     retry_jitter_factor: float = 0.2
+    retry_affinity_min_match: float = 0.0
+    retry_affinity_backoff_ms: int = 500
     disable_retries: bool = False
     # Health check configuration
     health_failure_threshold: int = 3
@@ -670,6 +672,20 @@ class RouterArgs:
             type=float,
             default=RouterArgs.retry_jitter_factor,
             help="Jitter factor (0.0-1.0) to add randomness to retry delays",
+        )
+        retry_group.add_argument(
+            f"--{prefix}retry-affinity-min-match",
+            type=float,
+            default=RouterArgs.retry_affinity_min_match,
+            help="Retry the same worker (after --retry-affinity-backoff-ms) when it answered a "
+            "retryable status and the policy had matched at least this share (0.0-1.0) of the "
+            "request text on it; 0 disables. Keeps a conversation on the replica holding its cache.",
+        )
+        retry_group.add_argument(
+            f"--{prefix}retry-affinity-backoff-ms",
+            type=int,
+            default=RouterArgs.retry_affinity_backoff_ms,
+            help="Wait in milliseconds before an affinity retry, so the worker can free a slot",
         )
         retry_group.add_argument(
             f"--{prefix}disable-retries",

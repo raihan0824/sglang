@@ -426,6 +426,16 @@ pub struct RetryConfig {
     /// D' = D * (1 + U[-j, +j]) where j is jitter factor
     #[serde(default = "default_retry_jitter_factor")]
     pub jitter_factor: f32,
+    /// When a worker answers a retryable status and the policy had matched at
+    /// least this share (0.0-1.0) of the request text on it, the first retry
+    /// goes back to that same worker after `affinity_backoff_ms` instead of to
+    /// another one, so a conversation stays on the replica holding its cache.
+    /// 0.0 disables it.
+    #[serde(default)]
+    pub affinity_min_match: f32,
+    /// Extra wait before an affinity retry, so the worker can free a slot.
+    #[serde(default = "default_retry_affinity_backoff_ms")]
+    pub affinity_backoff_ms: u64,
 }
 
 impl Default for RetryConfig {
@@ -436,12 +446,18 @@ impl Default for RetryConfig {
             max_backoff_ms: 30000,
             backoff_multiplier: 1.5,
             jitter_factor: 0.2,
+            affinity_min_match: 0.0,
+            affinity_backoff_ms: 500,
         }
     }
 }
 
 fn default_retry_jitter_factor() -> f32 {
     0.2
+}
+
+fn default_retry_affinity_backoff_ms() -> u64 {
+    500
 }
 
 /// Health check configuration for worker monitoring

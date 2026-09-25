@@ -146,6 +146,7 @@ mod tests {
             max_backoff_ms: 4,
             backoff_multiplier: 2.0,
             jitter_factor: 0.0,
+            ..Default::default()
         }
     }
 
@@ -157,6 +158,7 @@ mod tests {
             max_backoff_ms: 250,
             backoff_multiplier: 2.0,
             jitter_factor: 0.0,
+            ..Default::default()
         };
         assert_eq!(
             BackoffCalculator::calculate_delay(&cfg, 0),
@@ -184,6 +186,7 @@ mod tests {
             max_backoff_ms: 10_000,
             backoff_multiplier: 2.0,
             jitter_factor: 0.5,
+            ..Default::default()
         };
         let base = 400.0;
         for _ in 0..50 {
