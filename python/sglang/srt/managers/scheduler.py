@@ -3277,6 +3277,9 @@ class Scheduler(
             req.storage_prefetch_last_match_len = None
             req.staged_prefetch_plan = None
         if self.disaggregation_mode == DisaggregationMode.NULL:
+            if self._abort_cold_when_busy(req):
+                self._release_aborted_request(req)
+                return
             if self._abort_on_queued_limit(req):
                 self._release_aborted_request(req)
                 return
@@ -3452,6 +3455,54 @@ class Scheduler(
         """Share of the prompt a prefill would take from the prefix cache now."""
         match_prefix_for_req(self.tree_cache, req)
         return req.num_matched_prefix_tokens / max(len(req.origin_input_ids), 1)
+
+    def _abort_cold_when_busy(self, recv_req: Req) -> bool:
+        """Refuse recv_req if little of its prompt is cached while the replica is
+        nearly full. Returns True if it was refused.
+
+        Free slots = max_running_requests - running - waiting. With at most
+        SGLANG_COLD_ADMISSION_RESERVE_SLOTS of them left, a request with no more
+        than SGLANG_COLD_ADMISSION_MAX_CACHED_SHARE of its prompt in the prefix
+        cache is answered 429 at once, so the last slots go to requests that
+        continue conversations already on this replica: a small prefill, and an
+        answer with cached tokens keeps the conversation here. With more free
+        slots, or a reserve of 0, everything is admitted as before. Every TP
+        rank holds the same batch, queue and tree, so every rank decides alike.
+        """
+        reserve = envs.SGLANG_COLD_ADMISSION_RESERVE_SLOTS.get()
+        if reserve <= 0 or not _is_unstarted_req(recv_req):
+            return False
+        free_slots = (
+            self.max_running_requests
+            - len(self.running_batch.reqs)
+            - len(self.waiting_queue)
+        )
+        if free_slots > reserve:
+            return False
+        if (
+            self._cached_prompt_share(recv_req)
+            > envs.SGLANG_COLD_ADMISSION_MAX_CACHED_SHARE.get()
+        ):
+            return False
+        message = (
+            "The server is nearly full and keeps its last slots for requests "
+            "that continue conversations it has cached."
+        )
+        self.ipc_channels.send_to_tokenizer.send_output(
+            _make_abort_req(
+                recv_req,
+                finished_reason={
+                    "type": "abort",
+                    "status_code": HTTPStatus.TOO_MANY_REQUESTS,
+                    "message": message,
+                },
+            ),
+            recv_req,
+        )
+        recv_req.time_stats.trace_ctx.abort(abort_info={"reason": message})
+        if self.metrics_collector:
+            self.metrics_collector.increment_rejected_requests(reason="cold_when_busy")
+        return True
 
     def _poll_timeout_aborts(self) -> List[AbortReq]:
         """Emit aborts only; every rank must drop the same requests in the

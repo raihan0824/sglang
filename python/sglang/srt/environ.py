@@ -641,6 +641,12 @@ class Envs:
     # How much larger (0-1) the arriving request's cached share must be to displace
     # a waiting one.
     SGLANG_CACHE_AWARE_QUEUE_EVICTION_MIN_GAP = EnvFloat(0.25)
+    # Keep the last N free running slots (queued requests count as taken) for
+    # requests that continue conversations cached here: while at most N slots are
+    # free, a request with no more than MAX_CACHED_SHARE (0-1) of its prompt in
+    # the prefix cache is refused with 429 at once. 0 slots = off.
+    SGLANG_COLD_ADMISSION_RESERVE_SLOTS = EnvInt(0)
+    SGLANG_COLD_ADMISSION_MAX_CACHED_SHARE = EnvFloat(0.05)
     # For non-streaming requests, the scheduler still flushes intermediate
     # output batches to the tokenizer manager every N decoded tokens so that
     # `first_token_time`/TTFT can be recorded. Lower this (e.g. to 1) to get
