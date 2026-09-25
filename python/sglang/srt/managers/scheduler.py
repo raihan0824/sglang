@@ -220,6 +220,7 @@ from sglang.srt.managers.schedule_policy import (
     AddReqResult,
     PrefillAdder,
     SchedulePolicy,
+    match_prefix_for_req,
     resolve_system_prompt_checkpoint_token_id,
 )
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
@@ -3391,6 +3392,19 @@ class Scheduler(
                 req_to_abort = candidate_req
                 message = "The request is aborted by a higher priority request."
                 reason = "higher_priority"
+        elif envs.SGLANG_ENABLE_CACHE_AWARE_QUEUE_EVICTION.get():
+            idx = self._least_cached_waiting_index(recv_req)
+            if idx is not None:
+                candidate_req = self.waiting_queue[idx]
+                self._release_aborted_request(candidate_req)
+                self.waiting_queue.pop(idx)
+                self.beam_coordinator.retire_group(candidate_req)
+                req_to_abort = candidate_req
+                message = (
+                    "The request queue is full and a request with more of its "
+                    "prompt cached took this place."
+                )
+                reason = "less_cached"
 
         self.ipc_channels.send_to_tokenizer.send_output(
             _make_abort_req(
@@ -3407,6 +3421,37 @@ class Scheduler(
         if self.metrics_collector:
             self.metrics_collector.increment_rejected_requests(reason=reason)
         return req_to_abort.rid == recv_req.rid
+
+    def _least_cached_waiting_index(self, recv_req: Req) -> Optional[int]:
+        """Index of the waiting request to refuse in place of recv_req, or None.
+
+        That is the waiting request with the smallest share of its prompt in the
+        prefix cache (the latest queued on a tie), when recv_req's share is larger
+        by more than SGLANG_CACHE_AWARE_QUEUE_EVICTION_MIN_GAP. Every TP rank holds
+        the same tree and queue, so every rank picks the same request.
+        """
+        min_gap = envs.SGLANG_CACHE_AWARE_QUEUE_EVICTION_MIN_GAP.get()
+        if not _is_unstarted_req(recv_req):
+            return None
+        arriving_share = self._cached_prompt_share(recv_req)
+        if arriving_share <= min_gap:
+            # No waiting request can sit more than min_gap below it.
+            return None
+        best_idx, best_share = None, None
+        for idx, req in enumerate(self.waiting_queue):
+            if not _is_unstarted_req(req):
+                continue
+            share = self._cached_prompt_share(req)
+            if best_share is None or share <= best_share:
+                best_idx, best_share = idx, share
+        if best_idx is None or arriving_share - best_share <= min_gap:
+            return None
+        return best_idx
+
+    def _cached_prompt_share(self, req: Req) -> float:
+        """Share of the prompt a prefill would take from the prefix cache now."""
+        match_prefix_for_req(self.tree_cache, req)
+        return req.num_matched_prefix_tokens / max(len(req.origin_input_ids), 1)
 
     def _poll_timeout_aborts(self) -> List[AbortReq]:
         """Emit aborts only; every rank must drop the same requests in the
@@ -6155,4 +6200,16 @@ def _make_abort_req(
             current_version=get_serving().weight_version,
             num_output_tokens=len(req.output_ids),
         ),
+    )
+
+
+def _is_unstarted_req(req: Req) -> bool:
+    """Whether refusing req with a 429 is clean: nothing streamed, no cache state
+    held, no error already pending, not part of a streaming session."""
+    return (
+        req.to_finish is None
+        and len(req.output_ids) == 0
+        and req.session is None
+        and not req.kv.holds_kv
+        and not req.kv.holds_mamba
     )

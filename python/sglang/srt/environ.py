@@ -633,6 +633,14 @@ class Envs:
     SGLANG_KILLPG_ON_SCHEDULER_EXCEPTION = EnvBool(False)
     SGLANG_REQ_WAITING_TIMEOUT = EnvFloat(-1)  # in seconds
     SGLANG_REQ_RUNNING_TIMEOUT = EnvFloat(-1)  # in seconds
+    # When the waiting queue is full (--max-queued-requests), refuse the request with
+    # the smallest share of its prompt in the prefix cache, the arriving one or one
+    # already waiting, instead of always the arriving one, so cold prompts give way
+    # to follow-ups.
+    SGLANG_ENABLE_CACHE_AWARE_QUEUE_EVICTION = EnvBool(False)
+    # How much larger (0-1) the arriving request's cached share must be to displace
+    # a waiting one.
+    SGLANG_CACHE_AWARE_QUEUE_EVICTION_MIN_GAP = EnvFloat(0.25)
     # For non-streaming requests, the scheduler still flushes intermediate
     # output batches to the tokenizer manager every N decoded tokens so that
     # `first_token_time`/TTFT can be recorded. Lower this (e.g. to 1) to get
