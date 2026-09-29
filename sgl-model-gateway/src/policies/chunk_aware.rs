@@ -206,8 +206,12 @@ impl ChunkAwarePolicy {
                 config.eviction_interval_secs,
                 "ChunkAwareEviction",
                 move || {
-                    for tree_ref in trees_clone.iter() {
-                        tree_ref.value().evict_tenant_by_size(max_tree_size);
+                    // Walk the trees outside the map: a DashMap iterator holds its
+                    // shard's read lock, and every selection takes that shard for write.
+                    let trees: Vec<Arc<Tree>> =
+                        trees_clone.iter().map(|t| Arc::clone(t.value())).collect();
+                    for tree in trees {
+                        tree.evict_tenant_by_size(max_tree_size);
                     }
                 },
             ))
@@ -529,10 +533,11 @@ impl LoadBalancingPolicy for ChunkAwarePolicy {
         if text.is_empty() {
             return;
         }
-        for tree_ref in self.trees.iter() {
-            tree_ref
-                .value()
-                .remove_tenant_beyond(text, worker_url, matched_chars);
+        // Same as eviction: never walk a tree under the `trees` iterator's shard
+        // lock, which blocks every selection (`entry`) until the walk ends.
+        let trees: Vec<Arc<Tree>> = self.trees.iter().map(|t| Arc::clone(t.value())).collect();
+        for tree in trees {
+            tree.remove_tenant_beyond(text, worker_url, matched_chars);
         }
     }
 

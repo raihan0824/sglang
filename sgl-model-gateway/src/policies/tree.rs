@@ -321,6 +321,35 @@ fn intern_tenant(tenant: &str) -> TenantId {
     Arc::from(tenant)
 }
 
+/// Unlink `node` from its parent when it is still that parent's child and still
+/// has no children and no tenants.
+///
+/// Lock order: `insert` holds a parent's children-map shard while it takes a
+/// child's `text` lock to split the child. The first char is therefore read
+/// under a guard that is released before the parent's shard is taken; holding
+/// it across the removal deadlocks the two threads (router hang, 2026-09-29).
+/// With the guard released, a concurrent split can move `node` under a new
+/// parent with a shorter text between the reads and the removal: re-read and
+/// try again, and only ever remove the entry that still points at `node`.
+fn unlink_if_empty(node: &NodeRef) {
+    for _ in 0..3 {
+        let Some(parent) = node.parent.read().unwrap().clone() else {
+            return;
+        };
+        let Some(first_char) = node.text.read().unwrap().first_char() else {
+            return;
+        };
+        let mut still_linked = false;
+        let removed = parent.children.remove_if(&first_char, |_, child| {
+            still_linked = Arc::ptr_eq(child, node);
+            still_linked && node.children.is_empty() && node.tenant_last_access_time.is_empty()
+        });
+        if removed.is_some() || still_linked {
+            return;
+        }
+    }
+}
+
 impl Default for Tree {
     fn default() -> Self {
         Self::new()
@@ -791,11 +820,7 @@ impl Tree {
 
             // Remove empty nodes
             if node.children.is_empty() && node.tenant_last_access_time.is_empty() {
-                if let Some(ref parent) = parent_opt {
-                    if let Some(fc) = node.text.read().unwrap().first_char() {
-                        parent.children.remove(&fc);
-                    }
-                }
+                unlink_if_empty(&node);
             }
 
             // If parent has this tenant and no other children have it,
@@ -871,11 +896,7 @@ impl Tree {
 
             // Remove empty nodes
             if curr.children.is_empty() && curr.tenant_last_access_time.is_empty() {
-                if let Some(ref parent) = parent_opt {
-                    if let Some(fc) = curr.text.read().unwrap().first_char() {
-                        parent.children.remove(&fc);
-                    }
-                }
+                unlink_if_empty(&curr);
             }
 
             // If parent has this tenant and no other children have it,
@@ -975,12 +996,7 @@ impl Tree {
                     .and_modify(|count| *count = count.saturating_sub(node_len));
             }
             if node.children.is_empty() && node.tenant_last_access_time.is_empty() {
-                let parent_opt = node.parent.read().unwrap().clone();
-                if let Some(ref parent) = parent_opt {
-                    if let Some(fc) = node.text.read().unwrap().first_char() {
-                        parent.children.remove(&fc);
-                    }
-                }
+                unlink_if_empty(&node);
             }
         }
     }
@@ -2460,5 +2476,58 @@ mod tests {
             assert_eq!(matched, *text, "Failed for: {:?}", text);
             assert_eq!(matched_tenant, *tenant);
         }
+    }
+
+    /// Unlinking an emptied leaf (a refused request's cleanup, eviction) must
+    /// not hold the leaf's text lock while taking its parent's children shard:
+    /// `insert` takes them in the opposite order when it splits that leaf, and
+    /// the two threads deadlock (router hang, 2026-09-29).
+    #[test]
+    fn test_unlink_races_split_without_deadlock() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        fn spin_wait(flag: &AtomicUsize) {
+            flag.fetch_add(1, Ordering::SeqCst);
+            while flag.load(Ordering::SeqCst) < 2 {
+                std::hint::spin_loop();
+            }
+        }
+
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let prefix = "system prompt shared by every request of one app. ";
+            let keep = prefix.chars().count();
+            for i in 0..3_000usize {
+                for evict in [false, true] {
+                    let tree = Arc::new(Tree::new());
+                    tree.insert(&format!("{prefix}zz older"), "w1");
+                    tree.insert(&format!("{prefix}yy older"), "w2");
+                    let refused = format!("{prefix}question {i}: explain the failing test");
+                    let other = format!("{prefix}question {i}: summarize the diff");
+                    tree.insert(&refused, "w2");
+                    let gate = Arc::new(AtomicUsize::new(0));
+                    let (t, g) = (Arc::clone(&tree), Arc::clone(&gate));
+                    let unlink = std::thread::spawn(move || {
+                        spin_wait(&g);
+                        if evict {
+                            t.evict_tenant_by_size(0);
+                        } else {
+                            t.remove_tenant_beyond(&refused, "w2", keep);
+                        }
+                    });
+                    spin_wait(&gate);
+                    for _ in 0..(i * 7) % 300 {
+                        std::hint::spin_loop();
+                    }
+                    tree.insert(&other, "w1");
+                    unlink.join().unwrap();
+                }
+            }
+            let _ = tx.send(());
+        });
+        rx.recv_timeout(Duration::from_secs(120))
+            .expect("prefix tree deadlocked: leaf unlink raced a split of the same leaf");
     }
 }
