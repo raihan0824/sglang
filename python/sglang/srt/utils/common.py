@@ -1715,7 +1715,14 @@ def get_mm_http_session() -> requests.Session:
     pid = os.getpid()
     session = getattr(_mm_http_session, "session", None)
     if session is None or getattr(_mm_http_session, "pid", None) != pid:
+        from sglang.version import __version__
+
         session = requests.Session()
+        # Media hosts such as Wikimedia answer 403 to the default python-requests
+        # User-Agent (OpenRouter's image-URL test uses one), so name the client.
+        session.headers["User-Agent"] = (
+            f"SGLang/{__version__} (+https://github.com/sgl-project/sglang)"
+        )
         _mm_http_session.session = session
         _mm_http_session.pid = pid
     return session
