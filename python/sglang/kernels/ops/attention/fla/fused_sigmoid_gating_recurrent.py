@@ -429,6 +429,16 @@ def fused_sigmoid_gating_delta_rule_update(
     HV = v.shape[2]
     N = B if cu_seqlens is None else len(cu_seqlens) - 1
     BV, num_warps = _select_recurrent_launch_config(N, H, HV, K, V, is_kda)
+    if (
+        is_kda
+        and disable_state_update
+        and q.device.type == "cuda"
+        and torch.cuda.get_device_capability(q.device)[0] >= 10
+    ):
+        # KDA spec verify on Blackwell: value tiles of 16 measured 1.24x faster than 32 on B300 at
+        # GLM-5.3 c48 (48 requests x 8 tokens, 32 heads, K = V = 128; 8 and 64 are slower), outputs
+        # within 1.5e-5 and ring writes identical.
+        BV = 16
     BK = triton.next_power_of_2(K)
     NK, NV = triton.cdiv(K, BK), triton.cdiv(V, BV)
     assert NK == 1, "NK > 1 is not supported yet"
