@@ -232,6 +232,11 @@ def _maybe_precompute_flashmla_sched_meta(
 
     b, s_q = q.shape[0], q.shape[1]
     num_sm_parts = max(_num_sms(q.device.index) // s_q, 1)
+    # The scheduler kernel keeps (5 * b + 1 + num_sm_parts * META_INTS) ints in shared memory. Decoder bounded replay
+    # runs each prefill request's tail as 128 decode-layout rows, so a chunk packed with short requests on a
+    # 148-SM B300 overflows 48 KiB. Leave the metadata unset and let FlashMLA schedule natively (upstream #42273).
+    if 4 * (5 * b + 1 + num_sm_parts * META_INTS) > 48 * 1024:
+        return
     meta = torch.empty((num_sm_parts, META_INTS), dtype=torch.int32, device=q.device)
     num_splits = torch.empty((b + 1,), dtype=torch.int32, device=q.device)
     flashmla_sched_meta(
