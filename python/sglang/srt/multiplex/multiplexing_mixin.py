@@ -76,6 +76,9 @@ class SchedulerMultiplexMixin:
         stream_idx = get_current_stream_idx()
 
         self.tp_worker.model_runner.update_decode_attn_backend(stream_idx)
+        if self.draft_worker is not None:
+            for draft_runner in self.draft_worker._draft_model_runners():
+                draft_runner.update_decode_attn_backend(stream_idx)
         return stream_idx, self.stream_groups[stream_idx]
 
     def update_split_prefill_batch(

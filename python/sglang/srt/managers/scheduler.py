@@ -4475,8 +4475,17 @@ class Scheduler(
                     batch.spec_info.future_indices = future_indices
             elif self.enable_pdmux and batch.forward_mode.is_split_prefill():
                 resolve_forward_inputs(batch, self.future_map)
-                batch_result = self.tp_worker.forward_batch_split_prefill(batch)
-                self._relay_forward_payload(batch, batch.req_pool_indices, batch_result)
+                if batch.spec_algorithm.is_none():
+                    batch_result = self.tp_worker.forward_batch_split_prefill(batch)
+                    self._relay_forward_payload(
+                        batch, batch.req_pool_indices, batch_result
+                    )
+                else:
+                    # As on the non-overlap spec path: the draft input carries the
+                    # bonus tokens into the first verify round.
+                    batch_result = self.model_worker.forward_batch_split_prefill(batch)
+                    if batch_result.next_draft_input is not None:
+                        batch.spec_info = batch_result.next_draft_input
                 batch.input_ids = None
                 self._copy_auxiliary_output_to_cpu(batch, batch_result)
             elif not batch.spec_algorithm.is_none():
