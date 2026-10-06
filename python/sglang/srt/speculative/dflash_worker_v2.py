@@ -2034,7 +2034,10 @@ class DFlashWorkerV2(BaseSpecWorker):
         """
         if not self._need_mamba_verify_commit:
             return
-        attn_backend = self.target_worker.model_runner.attn_backend
+        target_runner = self.target_worker.model_runner
+        # Under PD multiplexing the verify ran on the current stream group's decode
+        # backend; attn_backend holds the split prefill's metadata.
+        attn_backend = target_runner.decode_attn_backend or target_runner.attn_backend
 
         last_correct_step_indices = commit_lens.to(torch.int64) - 1
         mamba_steps_to_track = None
