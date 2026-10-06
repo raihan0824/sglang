@@ -171,6 +171,10 @@ def free_kv_row_segments(
 
 def maybe_cache_unfinished_req(req: Req, tree_cache: BasePrefixCache, **kwargs):
     if req.skip_radix_cache_insert:
+        # Kept out of the tree; the next extend still resumes from prefix_indices.
+        req.prefix_indices = tree_cache.req_to_token_pool.req_to_token[
+            req.kv.req_pool_idx, : req.extend_range.end
+        ].to(dtype=torch.int64, copy=True)
         return
 
     tree_cache.cache_unfinished_req(req, **kwargs)
