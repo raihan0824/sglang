@@ -1203,6 +1203,86 @@ class Glm5NextModel(nn.Module):
             return hidden_states
         return hidden_states, aux_hidden_states
 
+    def forward_split_prefill(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        split_interval: Tuple[int, int],
+    ):
+        """Layers [start, end) of a prefill that PD multiplexing spreads over scheduler rounds.
+
+        What crosses a round boundary (the hidden/mHC state, the DSA top-k handed from layer to layer, the
+        scratch allocators and the captured hidden states) is kept on forward_batch. Returns what forward()
+        returns once the last layer has run, None before that.
+        """
+        start, end = split_interval
+        if start == 0:
+            hidden_states = self.embed_tokens(input_ids)
+            residual_batch.start(forward_batch)
+            device = hidden_states.device
+            total_num_layers = self.end_layer - self.start_layer
+            gemm_output_zero_allocator_size = getattr(
+                self, "gemm_output_zero_allocator_size", 0
+            )
+            forward_batch.glm5_split_state = {
+                "hidden_states": hidden_states,
+                "topk_indices": None,
+                "zero_allocator": BumpAllocator(
+                    buffer_size=total_num_layers * 2,
+                    dtype=torch.float32,
+                    device=device,
+                ),
+                "gemm_output_zero_allocator": (
+                    BumpAllocator(
+                        buffer_size=gemm_output_zero_allocator_size,
+                        dtype=torch.float32,
+                        device=device,
+                    )
+                    if gemm_output_zero_allocator_size > 0
+                    else None
+                ),
+                "aux_hidden_states": AuxHiddenStateList(),
+            }
+        state = forward_batch.glm5_split_state
+        hidden_states = state["hidden_states"]
+        topk_indices = state["topk_indices"]
+        aux_hidden_states = state["aux_hidden_states"]
+        for i in range(max(start, self.start_layer), min(end, self.end_layer)):
+            with get_global_expert_distribution_recorder().with_current_layer(i):
+
+                def capture_output(aux_hidden_state, *, owned=False):
+                    aux_hidden_state = self._prepare_aux_hidden_state(aux_hidden_state)
+                    owned = owned or (self.dflash_capture and self.config.mhc)
+                    if self.enable_a2a_moe and i > self.first_k_dense_replace:
+                        group = get_parallel().attn_tp_group
+                        aux_hidden_state = group.all_gather(aux_hidden_state, dim=0)
+                        owned = owned or group.world_size > 1
+                    aux_hidden_states.capture(aux_hidden_state, owned=owned)
+
+                hidden_states, topk_indices = self.layers[i](
+                    positions,
+                    hidden_states,
+                    forward_batch,
+                    state["zero_allocator"],
+                    state["gemm_output_zero_allocator"],
+                    prev_topk_indices=topk_indices,
+                    capture_output=capture_output
+                    if i in self.layers_to_capture
+                    else None,
+                )
+        state["hidden_states"] = hidden_states
+        state["topk_indices"] = topk_indices
+        if end < self.end_layer:
+            return None
+
+        forward_batch.glm5_split_state = None
+        hidden_states = residual_batch.complete_output(hidden_states, forward_batch)
+        hidden_states = residual_batch.norm(hidden_states, forward_batch, self.norm)
+        if len(aux_hidden_states) == 0:
+            return hidden_states
+        return hidden_states, aux_hidden_states
+
 
 class Glm5NextForConditionalGeneration(nn.Module):
     hf_to_sglang_mapper = WeightsMapper(
@@ -1545,6 +1625,39 @@ class Glm5NextForConditionalGeneration(nn.Module):
             )
         else:
             return hidden_states
+
+    @torch.no_grad()
+    def forward_split_prefill(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        split_interval: Tuple[int, int],  # [start, end) 0-based
+        input_embeds: torch.Tensor = None,
+    ):
+        """PD multiplexing: run layers [start, end) of a text prefill; logits after the last layer."""
+        if forward_batch.contains_mm_inputs():
+            raise NotImplementedError(
+                "GLM-5 split prefill (PD multiplexing) does not take image or video inputs yet"
+            )
+        if self.is_mrope_enabled:
+            positions = forward_batch.mrope_positions
+
+        with get_attn_tp_context().maybe_input_scattered(forward_batch):
+            out = self.model.forward_split_prefill(
+                input_ids, positions, forward_batch, split_interval
+            )
+        if out is None:
+            return None
+
+        aux_hidden_states = None
+        if self.capture_aux_hidden_states:
+            hidden_states, aux_hidden_states = out
+        else:
+            hidden_states = out
+        return self.logits_processor(
+            input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
+        )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
         if is_nextn:

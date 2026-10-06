@@ -63,6 +63,9 @@ def get_arch_constraints(compute_capability):
         return 4, 2
     elif major == 9 and minor >= 0:
         return 8, 8
+    elif major == 10:
+        # Blackwell (B200/B300): green-context splits of 48/100, 64/84, 80/68 and 96/52 SMs create and run on B300.
+        return 8, 8
     else:
         raise ValueError(f"Unsupported compute capability: {major}.{minor}")
 
