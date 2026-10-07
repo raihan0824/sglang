@@ -346,18 +346,22 @@ class TestDeepSeekV41ParameterGrammar(CustomTestCase):
             )
         )
 
-    def test_non_strict_still_uses_native_parameters(self):
+    def test_non_strict_forced_call_uses_native_parameters_and_the_schema(self):
+        """A forced call follows the schema even without strict (gateways drop it),
+        in the native DSML parameter format."""
         self.tools[0].function.strict = False
         grammar = self._grammar()
         self.assertTrue(
+            _is_grammar_accept_string(grammar, self._render({"city": "Paris"}))
+        )
+        self.assertFalse(
             _is_grammar_accept_string(grammar, self._render({"extra": [True, None, 2]}))
         )
+        self.assertFalse(_is_grammar_accept_string(grammar, self._render({})))
         self.assertFalse(
             _is_grammar_accept_string(
                 grammar,
-                self._render({"extra": [True, None, 2]}).replace(
-                    "[true, null, 2]", "invalid"
-                ),
+                self._render({"city": "Paris"}).replace('string="true">Paris', "invalid"),
             )
         )
 

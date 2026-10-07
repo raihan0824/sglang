@@ -13,7 +13,12 @@ from sglang.srt.managers.schedule_policy import (
     resolve_system_prompt_checkpoint_token_id,
     system_prompt_checkpoints,
 )
-from sglang.srt.mem_cache.base_prefix_cache import DecLockRefResult, IncLockRefResult
+from sglang.srt.mem_cache.base_prefix_cache import (
+    CacheRequestHandle,
+    DecLockRefResult,
+    IncLockRefResult,
+)
+from sglang.srt.mem_cache.prefill_budget import PrefillBudget
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.srt.utils.common import Range
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -94,7 +99,14 @@ class _AdderFixture(CustomTestCase):
         self.tree_cache.sliding_window_size = 128
         self.tree_cache.inc_lock_ref.return_value = IncLockRefResult()
         self.tree_cache.dec_lock_ref.return_value = DecLockRefResult()
+        self.tree_cache.buffer_pipeline = None
+        self.tree_cache.supports_mamba.return_value = False
         self.allocator = MagicMock()
+        self.allocator.swa_req_ring = False
+        self.allocator.page_size = PAGE
+        self.allocator.create_prefill_budget.side_effect = lambda tree_cache, **kwargs: (
+            PrefillBudget(self.allocator, tree_cache, **kwargs)
+        )
         for name in ("full_available_size", "swa_available_size", "available_size"):
             getattr(self.allocator, name).return_value = 10_000_000
         self.allocator.size_swa = 10_000_000
@@ -118,6 +130,8 @@ class _AdderFixture(CustomTestCase):
     def req(self, rid, ids, prefix_len=0, max_new_tokens=256):
         req = MagicMock(spec=Req)
         req.rid = rid
+        req.cache_request_handle = CacheRequestHandle(rid, 0)
+        req.finished.return_value = False
         req.origin_input_ids = ids
         req.full_untruncated_fill_ids = list(ids)
         req.prefix_indices = list(range(prefix_len))

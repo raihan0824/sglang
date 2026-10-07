@@ -20,9 +20,10 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import Scheduler
-from sglang.srt.mem_cache.base_prefix_cache import InsertParams
+from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle, InsertParams
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
 from sglang.srt.sampling.sampling_params import SamplingParams
 
@@ -32,6 +33,7 @@ register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 class _FakeReq:
     def __init__(self, rid, *, output_ids=(), to_finish=None, holds_kv=False):
         self.rid = rid
+        self.cache_request_handle = CacheRequestHandle(rid, 0)
         self.to_finish = to_finish
         self.output_ids = list(output_ids)
         self.session = None
@@ -45,6 +47,7 @@ class _FakeReq:
 
 def _scheduler(waiting_queue, *, max_queued, tree_cache=None, shares=None):
     s = Scheduler.__new__(Scheduler)
+    s.disaggregation_mode = DisaggregationMode.NULL
     s.waiting_queue = list(waiting_queue)
     s.max_queued_requests = max_queued
     s.enable_priority_scheduling = False
@@ -55,7 +58,7 @@ def _scheduler(waiting_queue, *, max_queued, tree_cache=None, shares=None):
     s.ipc_channels = SimpleNamespace(send_to_tokenizer=MagicMock())
     s.beam_coordinator = MagicMock()
     s.metrics_collector = MagicMock()
-    s.tree_cache = tree_cache
+    s.tree_cache = tree_cache if tree_cache is not None else MagicMock()
     if shares is not None:
         s._cached_prompt_share = MagicMock(side_effect=lambda req: shares[req.rid])
     return s
