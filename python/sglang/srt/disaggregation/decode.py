@@ -2804,43 +2804,53 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         return bool(self._deferred_releases)
 
     def resolve_deferred_releases(self) -> None:
-        """Release drained transfers; device destinations may also time out."""
+        """Release drained transfers; device destinations may also time out.
+
+        Every rank must release the same entries in the same iteration. Each rank gets its own drain acks and reads
+        its own clock, so a rank-local decision frees KV pages and metadata slots on one rank first; the next
+        preallocation then admits different requests per rank and the transfer-queue poll all-reduce no longer
+        lines up (gloo "collective mismatch", decode scheduler crash). So the per-entry decision is MIN-reduced.
+        """
         if not self._deferred_releases:
             return
-        host_ready = torch.tensor(
+        now = time.monotonic()
+        drained = [
+            req.kv_receiver.kv_mgr.is_abort_release_safe(req.req.bootstrap_room, acks)
+            for req, _, _, acks in self._deferred_releases
+        ]
+        # A timeout cannot prove that a remote write into host pages has stopped: host entries wait for the drain.
+        ready = torch.tensor(
             [
-                req.kv_receiver.kv_mgr.is_abort_release_safe(
-                    req.req.bootstrap_room, acks
+                int(
+                    done
+                    or (
+                        not (self.enable_host_receive and req.host_staged)
+                        and now >= deadline
+                    )
                 )
-                for req, _, _, acks in self._deferred_releases
-                if self.enable_host_receive and req.host_staged
+                for (req, deadline, _, _), done in zip(self._deferred_releases, drained)
             ],
             dtype=torch.int32,
         )
-        if host_ready.numel() and torch.distributed.get_world_size(self.gloo_group) > 1:
-            # Admission must see identical host capacity and page order on every rank.
+        if (
+            self.gloo_group is not None
+            and torch.distributed.get_world_size(self.gloo_group) > 1
+        ):
             torch.distributed.all_reduce(
-                host_ready, op=torch.distributed.ReduceOp.MIN, group=self.gloo_group
+                ready, op=torch.distributed.ReduceOp.MIN, group=self.gloo_group
             )
-        host_ready = iter(host_ready.tolist())
-        now = time.monotonic()
         still_held = []
         to_release = []
-        for decode_req, deadline, idx, required_acks in self._deferred_releases:
-            room = decode_req.req.bootstrap_room
-            if self.enable_host_receive and decode_req.host_staged:
-                if next(host_ready):
-                    to_release.append((decode_req, idx, room, True))
-                else:
-                    # A timeout cannot prove that a remote write has stopped.
-                    still_held.append((decode_req, deadline, idx, required_acks))
-                continue
-            kv_mgr = decode_req.kv_receiver.kv_mgr
-            drained = kv_mgr.is_abort_release_safe(room, required_acks)
-            if not drained and now < deadline:
-                still_held.append((decode_req, deadline, idx, required_acks))
+        for entry, done, release in zip(
+            self._deferred_releases, drained, ready.tolist()
+        ):
+            decode_req, _, idx, _ = entry
+            if release:
+                to_release.append(
+                    (decode_req, idx, decode_req.req.bootstrap_room, done)
+                )
             else:
-                to_release.append((decode_req, idx, room, drained))
+                still_held.append(entry)
         # Commit the survivors before releasing so a _do_release exception can't
         # leave a released entry in the list (double-free / None receiver on retry).
         self._deferred_releases = still_held

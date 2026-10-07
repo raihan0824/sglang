@@ -222,6 +222,7 @@ def _make_queue(timeout=30.0):
     q.tree_cache = object()
     q.metadata_buffers = SimpleNamespace(bootstrap_room={})
     q.req_to_metadata_buffer_idx_allocator = _FakeIdxAllocator()
+    q.gloo_group = None  # single rank unless a test sets a group
     return q
 
 
@@ -272,6 +273,40 @@ class TestResolveDeferredReleases(CustomTestCase):
             self.assertEqual(discard.call_count, 2)
             self.assertEqual(q._deferred_releases, [])
             device_release.assert_not_called()
+
+    def test_device_release_waits_for_every_rank(self):
+        # TP2 decode: this rank has its drain ack (and later its deadline), the peer does not. Releasing here alone
+        # would free pages and a metadata slot on one rank only and desync the next preallocation across ranks.
+        mgr = _make_manager()
+        q = _make_queue(timeout=30.0)
+        q.gloo_group = object()
+        dreq = _make_decode_req(500, 5, mgr)
+        mgr.register_deferred_abort_room(500)
+        q._defer_release(dreq)
+        mgr.note_abort_ack(500, 0)
+        peer_ready = [0]
+
+        def reduce_min(ready, **_):
+            ready.clamp_(max=peer_ready[0])
+
+        with (
+            patch.object(decode_mod, "release_kv_cache") as rel,
+            patch("torch.distributed.get_world_size", return_value=2),
+            patch("torch.distributed.all_reduce", side_effect=reduce_min) as reduce,
+        ):
+            q.resolve_deferred_releases()
+            reduce.assert_called_once()
+            rel.assert_not_called()
+            self.assertEqual(len(q._deferred_releases), 1)
+            # Past the deadline here too: still held while the peer is not ready.
+            q._deferred_releases[0] = (dreq, float("-inf"), 5, 1)
+            q.resolve_deferred_releases()
+            rel.assert_not_called()
+            peer_ready[0] = 1
+            q.resolve_deferred_releases()
+            rel.assert_called_once_with(dreq.req, q.tree_cache, is_insert=False)
+        self.assertEqual(q._deferred_releases, [])
+        self.assertEqual(q.req_to_metadata_buffer_idx_allocator.freed, [5])
 
     def test_noop_when_nothing_deferred(self):
         q = _make_queue()
