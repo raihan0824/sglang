@@ -204,6 +204,37 @@ class TestDeepSeekV41ConstrainedDecoding(CustomTestCase):
         self.assertFalse(_is_grammar_accept_string(grammar, begin + end))
         self.assertFalse(_is_grammar_accept_string(grammar, begin + "{}" + end))
 
+    def test_forced_calls_follow_the_schema_without_strict(self):
+        """Gateways drop "strict" (LiteLLM's hosted_vllm adapter does), so a forced
+        call carries the parameter schema anyway: "{}" and an empty body fail."""
+        self.assertFalse(self.tools[0].function.strict)
+        begin = f'\n\n<{DSML} calls>\n<{DSML} invoke name="get_weather">\n'
+        end = f"</{DSML} invoke>\n</{DSML} calls>"
+        xml = f'<{DSML} parameter name="city" string="true">Paris</{DSML} parameter>\n'
+        named = ToolChoice(function=ToolChoiceFuncName(name="get_weather"))
+        for choice in ("required", named):
+            with self.subTest(tool_choice=choice):
+                tag = self.detector.get_structural_tag(tools=self.tools, tool_choice=choice)
+                grammar = xgr.Grammar.from_structural_tag(tag)
+
+                def accepts(body):
+                    return _is_grammar_accept_string(grammar, begin + body + end)
+
+                self.assertTrue(accepts(xml) or accepts('{"city":"Paris"}'))
+                self.assertFalse(accepts("{}"))
+                self.assertFalse(accepts(""))
+        # The request's own tools keep their strict flag.
+        self.assertFalse(self.tools[0].function.strict)
+
+    def test_auto_tag_is_unchanged_without_strict(self):
+        from sglang.srt.function_call.deepseekv32_detector import DeepSeekV32Detector
+
+        ours = self.detector.get_structural_tag(tools=self.tools, tool_choice="auto")
+        base = DeepSeekV32Detector.get_structural_tag(
+            self.detector, tools=self.tools, tool_choice="auto"
+        )
+        self.assertEqual(ours, base)
+
 
 @unittest.skipUnless(
     "deepseek_v4_1_xml" in get_args(JSONSchemaFormat.model_fields["style"].annotation),

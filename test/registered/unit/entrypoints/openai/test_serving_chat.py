@@ -1627,6 +1627,52 @@ class ServingChatTestCase(CustomTestCase):
                 with self.assertRaisesRegex(ValueError, "must be a JSON object"):
                     self.chat._process_messages(req, is_multimodal=False)
 
+    def test_dsv41_tool_choice_none_keeps_tools_out_of_the_prompt(self):
+        """The tool-call parser is off for tool_choice="none", so a tool listed in
+        the V4.1 prompt would come back as raw DSML in the content."""
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.chat.chat_encoding_spec = "dsv41"
+
+        def tool(name):
+            return {
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": "Weather lookup",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"location": {"type": "string"}},
+                        "required": ["location"],
+                    },
+                },
+            }
+
+        prompts = {}
+        for choice in ("auto", "none"):
+            req = ChatCompletionRequest(
+                model="x",
+                messages=[
+                    {
+                        "role": "developer",
+                        "content": "Be brief.",
+                        "tools": [tool("lookup_forecast")],
+                    },
+                    {"role": "user", "content": "Weather in Boston?"},
+                ],
+                tools=[tool("get_current_weather")],
+                tool_choice=choice,
+            )
+            self.chat._process_messages(req, is_multimodal=False)
+            prompts[choice] = self.tm.tokenizer.encode.call_args.args[0]
+
+        self.assertIn("get_current_weather", prompts["auto"])
+        self.assertIn("lookup_forecast", prompts["auto"])
+        self.assertNotIn("get_current_weather", prompts["none"])
+        self.assertNotIn("lookup_forecast", prompts["none"])
+        self.assertIn("Weather in Boston?", prompts["none"])
+        self.assertIn("Be brief.", prompts["none"])
+
     def test_dsv_encoders_accept_object_tool_call_arguments_string(self):
         """DeepSeek encoders accept object-shaped OpenAI JSON string arguments."""
         self.template_manager.chat_template_name = None

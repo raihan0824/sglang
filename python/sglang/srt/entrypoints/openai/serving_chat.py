@@ -1548,18 +1548,27 @@ class OpenAIServingChat(OpenAIServingBase):
                 messages, request
             )
 
+            # tool_choice="none" keeps every tool out of the prompt, as the Jinja
+            # path does: the tool-call parser is off for "none", so a model that
+            # still sees the tools calls one and the raw DSML lands in content.
+            prompt_tools = request.tools
+            if request.tool_choice == "none":
+                prompt_tools = None
+                for msg in messages:
+                    msg.pop("tools", None)
+
             # An empty system message hosts the request tools; dsv41 renders a
             # system token for it, so it only gets one when tools need the host.
-            if messages[0]["role"] != "system" and (request.tools or not is_dsv41):
+            if messages[0]["role"] != "system" and (prompt_tools or not is_dsv41):
                 messages.insert(0, {"role": "system", "content": ""})
-            if request.tools:
+            if prompt_tools:
                 messages[0]["tools"] = [
                     (
                         chat_encoding.dsv41_tool_payload(tool)
                         if is_dsv41
                         else tool.model_dump()
                     )
-                    for tool in request.tools
+                    for tool in prompt_tools
                 ]
 
             # Default encoding (dsv4/dsv41/dsv32)
