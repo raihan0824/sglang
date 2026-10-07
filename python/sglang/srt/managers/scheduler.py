@@ -3339,11 +3339,11 @@ class Scheduler(
         """Requests counted against --max-queued-requests."""
         num_queued = len(self.waiting_queue)
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            # A prefill server also holds requests waiting for a decode server to take them (bootstrap queue)
-            # and requests whose KV is still being sent (inflight queue). Counting them turns a busy prefill,
-            # a full decode side and a slow KV link alike into fast refusals instead of long waits.
+            # A prefill server also holds requests waiting for a decode server to take them (bootstrap queue): with a
+            # full decode side they wait there, as a colocated server's requests wait for a running slot. Requests
+            # whose KV is being sent (inflight queue) are already prefilled and do not delay a new arrival, so they
+            # do not count (counting them left ~1 free place at --max-queued-requests 4 on a TCP KV link).
             num_queued += len(self.disagg_prefill_bootstrap_queue.queue)
-            num_queued += len(self.disagg_prefill_inflight_queue)
         return num_queued
 
     def _abort_on_queued_limit(self, recv_req: Req) -> bool:

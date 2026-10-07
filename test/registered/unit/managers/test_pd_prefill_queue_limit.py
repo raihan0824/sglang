@@ -1,8 +1,8 @@
 """--max-queued-requests on a disaggregated (PD) prefill server.
 
 The limit used to apply only in NULL mode, so a PD deployment queued without bound and never answered 429. On a
-prefill server it now counts every request not yet handed to a decode server: the waiting queue, the bootstrap queue
-(waiting for a decode server to take the request) and the inflight queue (KV still being sent).
+prefill server it counts the waiting queue and the bootstrap queue (waiting for a decode server to take the request),
+not the inflight queue: those requests are already prefilled and only wait for their KV to be sent.
 """
 
 import unittest
@@ -76,9 +76,9 @@ class TestPrefillServerQueueLimit(unittest.TestCase):
         return abort_req.finished_reason
 
     def test_full_prefill_server_answers_429_before_bootstrap(self):
-        # 1 waiting + 1 in bootstrap + 1 sending KV = 3 = the limit.
+        # 2 waiting + 1 in bootstrap = 3 = the limit.
         s = self._scheduler(
-            DisaggregationMode.PREFILL, max_queued=3, waiting=1, bootstrap=1, inflight=1
+            DisaggregationMode.PREFILL, max_queued=3, waiting=2, bootstrap=1
         )
         incoming = self._req()
         self._add(s, incoming)
@@ -95,21 +95,28 @@ class TestPrefillServerQueueLimit(unittest.TestCase):
 
     def test_prefill_server_below_the_limit_admits(self):
         s = self._scheduler(
-            DisaggregationMode.PREFILL, max_queued=4, waiting=1, bootstrap=1, inflight=1
+            DisaggregationMode.PREFILL, max_queued=3, waiting=1, bootstrap=1
         )
         incoming = self._req()
         self._add(s, incoming)
         s.disagg_prefill_bootstrap_queue.add.assert_called_once_with(incoming, 1)
         s.ipc_channels.send_to_tokenizer.send_output.assert_not_called()
 
-    def test_each_prefill_queue_counts(self):
-        for waiting, bootstrap, inflight in ((2, 0, 0), (0, 2, 0), (0, 0, 2)):
-            with self.subTest(waiting=waiting, bootstrap=bootstrap, inflight=inflight):
-                s = self._scheduler(
-                    DisaggregationMode.PREFILL, 2, waiting, bootstrap, inflight
-                )
+    def test_waiting_and_bootstrap_queues_count(self):
+        for waiting, bootstrap in ((2, 0), (0, 2), (1, 1)):
+            with self.subTest(waiting=waiting, bootstrap=bootstrap):
+                s = self._scheduler(DisaggregationMode.PREFILL, 2, waiting, bootstrap)
                 self._add(s, self._req())
                 s.disagg_prefill_bootstrap_queue.add.assert_not_called()
+
+    def test_requests_sending_kv_do_not_count(self):
+        # Already prefilled, only waiting for the KV link: a new arrival does not queue behind them.
+        s = self._scheduler(
+            DisaggregationMode.PREFILL, max_queued=2, waiting=1, inflight=8
+        )
+        incoming = self._req()
+        self._add(s, incoming)
+        s.disagg_prefill_bootstrap_queue.add.assert_called_once_with(incoming, 1)
 
     def test_priority_scheduling_never_evicts_on_a_prefill_server(self):
         # The waiting queue is empty, the bootstrap queue is full: reject the arrival, do not touch the queues.
