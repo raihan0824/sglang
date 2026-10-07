@@ -34,6 +34,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     ToolChoice,
     ToolChoiceFuncName,
 )
+from sglang.srt.entrypoints.openai.serving_base import RequestAbortedError
 from sglang.srt.entrypoints.openai.serving_chat import (
     OpenAIServingChat,
     normalize_tool_content,
@@ -2827,7 +2828,8 @@ class ServingChatTestCase(CustomTestCase):
             OpenAIServingChat(tm, TemplateManager())
 
     def test_streaming_abort_yields_error(self):
-        """Test that an abort finish reason during streaming correctly yields an error and stops."""
+        """An abort before anything streamed raises RequestAbortedError, so the endpoint returns a real HTTP status
+        (e.g. 429 for a full queue) instead of HTTP 200 with an in-band error frame."""
         err_msg = "Aborted by scheduler"
         err_code = HTTPStatus.INTERNAL_SERVER_ERROR
 
@@ -2866,7 +2868,6 @@ class ServingChatTestCase(CustomTestCase):
         with patch(
             "sglang.srt.entrypoints.openai.serving_chat.generate_chat_conv"
         ) as conv_mock:
-            # Create a mock conversation object
             conv_ins = Mock()
             conv_ins.get_prompt.return_value = "Test prompt"
             conv_mock.return_value = conv_ins
@@ -2882,32 +2883,110 @@ class ServingChatTestCase(CustomTestCase):
                         adapted_request, req, self.fastapi_request
                     ):
                         chunks.append(chunk)
-                except Exception as e:
-                    print(f"Error during stream iteration: {e}")
-                return chunks
+                except RequestAbortedError as e:
+                    return chunks, e
+                return chunks, None
 
         loop = get_or_create_event_loop()
-        chunks = loop.run_until_complete(run_stream())
+        chunks, aborted = loop.run_until_complete(run_stream())
 
-        error_chunk_data = None
-        for c in chunks:
-            if "error" in c:
-                error_chunk_data = json.loads(c[len("data: ") :])
-                break
-        self.assertIsNotNone(error_chunk_data, "Error chunk not found in stream")
+        self.assertEqual(chunks, [], "nothing may stream before a pre-stream abort")
+        self.assertIsNotNone(
+            aborted, "a pre-stream abort must raise RequestAbortedError"
+        )
+        self.assertEqual(aborted.status_code, err_code)
+        self.assertEqual(aborted.message, err_msg)
+
+    def test_streaming_abort_after_first_chunk_yields_error_frame(self):
+        """An abort after the stream started (HTTP 200 already sent) still ends it with an error frame and [DONE]."""
+        err_msg = "Aborted by scheduler"
+        err_code = HTTPStatus.INTERNAL_SERVER_ERROR
+
+        async def _mock_generate_abort():
+            yield {
+                "text": "Partial ",
+                "meta_info": {
+                    "id": "chatcmpl-test",
+                    "prompt_tokens": 10,
+                    "completion_tokens": 2,
+                    "cached_tokens": 0,
+                    "finish_reason": None,
+                    "output_token_logprobs": [],
+                    "output_token_logprobs_length": 0,
+                    "output_top_logprobs": [],
+                },
+                "index": 0,
+            }
+            yield {
+                "text": "Partial more",
+                "meta_info": {
+                    "id": "chatcmpl-test",
+                    "prompt_tokens": 10,
+                    "completion_tokens": 2,
+                    "cached_tokens": 0,
+                    "finish_reason": {
+                        "type": "abort",
+                        "status_code": err_code,
+                        "message": err_msg,
+                    },
+                    "output_token_logprobs": [],
+                    "output_token_logprobs_length": 0,
+                    "output_top_logprobs": [],
+                },
+                "index": 0,
+            }
+
+        self.tm.generate_request.return_value = _mock_generate_abort()
+
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            temperature=0.7,
+            max_tokens=100,
+            stream=True,
+            logprobs=True,
+            top_logprobs=5,
+        )
+
+        with patch(
+            "sglang.srt.entrypoints.openai.serving_chat.generate_chat_conv"
+        ) as conv_mock:
+            conv_ins = Mock()
+            conv_ins.get_prompt.return_value = "Test prompt"
+            conv_mock.return_value = conv_ins
+
+            adapted_request, _ = self.chat._convert_to_internal_request(
+                req, self.fastapi_request
+            )
+
+            async def run_stream():
+                chunks = []
+                try:
+                    async for chunk in self.chat._generate_chat_stream(
+                        adapted_request, req, self.fastapi_request
+                    ):
+                        chunks.append(chunk)
+                except RequestAbortedError as e:
+                    return chunks, e
+                return chunks, None
+
+        loop = get_or_create_event_loop()
+        chunks, aborted = loop.run_until_complete(run_stream())
+
+        self.assertIsNone(aborted)
+        error_idx = next(i for i, c in enumerate(chunks) if '"error"' in c)
+        self.assertGreater(error_idx, 0, "content must stream before the abort")
+        error_chunk_data = json.loads(chunks[error_idx][len("data: ") :])
         self.assertEqual(error_chunk_data["error"]["message"], err_msg)
         self.assertEqual(error_chunk_data["error"]["code"], err_code.value)
-
-        # Ensure the stream stops after the abort error
-        # The last chunk should be "data: [DONE]\n\n"
         self.assertEqual(chunks[-1], "data: [DONE]\n\n")
-
-        # Check that there is an error chunk and a DONE chunk
-        self.assertEqual(len(chunks), 2)
-        self.assertIn("error", chunks[0])
+        self.assertEqual(
+            error_idx, len(chunks) - 2, "only [DONE] may follow the error frame"
+        )
 
     def test_streaming_abort_with_ids_enabled(self):
-        """Test that a terminal abort with input/output ids enabled yields only an error and [DONE]."""
+        """A mid-stream abort with input/output ids enabled ends with the error frame and [DONE]; no sglext ids event
+        follows the error."""
         err_msg = "Aborted by scheduler"
         err_code = HTTPStatus.INTERNAL_SERVER_ERROR
 
@@ -2921,13 +3000,30 @@ class ServingChatTestCase(CustomTestCase):
                     "prompt_tokens": 10,
                     "completion_tokens": 2,
                     "cached_tokens": 0,
+                    "finish_reason": None,
+                    "output_token_logprobs": [],
+                    "output_token_logprobs_length": 0,
+                    "output_top_logprobs": [],
+                },
+                "index": 0,
+            }
+            yield {
+                "text": "Partial more",
+                "prompt_token_ids": [4, 5, 6],
+                "output_ids": [1, 2, 3],
+                "meta_info": {
+                    "id": "chatcmpl-test",
+                    "prompt_tokens": 10,
+                    "completion_tokens": 2,
+                    "cached_tokens": 0,
                     "finish_reason": {
                         "type": "abort",
                         "status_code": err_code,
                         "message": err_msg,
                     },
-                    "output_token_logprobs": None,
-                    "output_top_logprobs": None,
+                    "output_token_logprobs": [],
+                    "output_token_logprobs_length": 0,
+                    "output_top_logprobs": [],
                 },
                 "index": 0,
             }
@@ -2962,24 +3058,20 @@ class ServingChatTestCase(CustomTestCase):
                         adapted_request, req, self.fastapi_request
                     ):
                         chunks.append(chunk)
-                except Exception as e:
-                    print(f"Error during stream iteration: {e}")
-                return chunks
+                except RequestAbortedError as e:
+                    return chunks, e
+                return chunks, None
 
         loop = get_or_create_event_loop()
-        chunks = loop.run_until_complete(run_stream())
+        chunks, aborted = loop.run_until_complete(run_stream())
 
-        # Exactly one error chunk followed by [DONE]; no sglext ids leak.
-        self.assertIn("error", chunks[0])
-        self.assertEqual(chunks[1], "data: [DONE]\n\n")
+        self.assertIsNone(aborted)
+        error_idx = next(i for i, c in enumerate(chunks) if '"error"' in c)
+        self.assertEqual(chunks[error_idx + 1 :], ["data: [DONE]\n\n"])
         self.assertFalse(
-            any("input_ids" in c or "output_ids" in c for c in chunks),
+            any("input_ids" in c or "output_ids" in c for c in chunks[error_idx:]),
             "sglext ids event leaked after abort error",
         )
-
-        error_chunk_data = json.loads(chunks[0][len("data: ") :])
-        self.assertEqual(error_chunk_data["error"]["message"], err_msg)
-        self.assertEqual(error_chunk_data["error"]["code"], err_code.value)
 
     def test_streaming_error_abort_still_finalizes_other_choices(self):
         """An error abort ends generation but still runs finalization, so a

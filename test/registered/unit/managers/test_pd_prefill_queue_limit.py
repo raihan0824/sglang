@@ -26,7 +26,9 @@ class TestPrefillServerQueueLimit(unittest.TestCase):
         self.addCleanup(reset_context)
         publish(ServerArgs(model_path="dummy"), role="tokenizer")
 
-    def _scheduler(self, mode, max_queued, waiting=0, bootstrap=0, inflight=0, priority=False):
+    def _scheduler(
+        self, mode, max_queued, waiting=0, bootstrap=0, inflight=0, priority=False
+    ):
         s = Scheduler.__new__(Scheduler)
         s.disaggregation_mode = mode
         s.enable_priority_scheduling = priority
@@ -42,7 +44,9 @@ class TestPrefillServerQueueLimit(unittest.TestCase):
         s.tree_cache = MagicMock(spec=["finish"])
         s.model_config = SimpleNamespace(num_key_value_heads=1)
         s.disagg_prefill_bootstrap_queue = MagicMock()
-        s.disagg_prefill_bootstrap_queue.queue = [self._req(f"b{i}") for i in range(bootstrap)]
+        s.disagg_prefill_bootstrap_queue.queue = [
+            self._req(f"b{i}") for i in range(bootstrap)
+        ]
         s.disagg_prefill_inflight_queue = [self._req(f"i{i}") for i in range(inflight)]
         s.disagg_decode_prealloc_queue = MagicMock()
         s.ipc_channels = MagicMock()
@@ -73,18 +77,26 @@ class TestPrefillServerQueueLimit(unittest.TestCase):
 
     def test_full_prefill_server_answers_429_before_bootstrap(self):
         # 1 waiting + 1 in bootstrap + 1 sending KV = 3 = the limit.
-        s = self._scheduler(DisaggregationMode.PREFILL, max_queued=3, waiting=1, bootstrap=1, inflight=1)
+        s = self._scheduler(
+            DisaggregationMode.PREFILL, max_queued=3, waiting=1, bootstrap=1, inflight=1
+        )
         incoming = self._req()
         self._add(s, incoming)
         s.disagg_prefill_bootstrap_queue.add.assert_not_called()
         s._prefetch_kvcache.assert_not_called()
-        s.tree_cache.finish.assert_called_once_with(incoming.cache_request_handle, CacheRequestOutcome.ABORT)
+        s.tree_cache.finish.assert_called_once_with(
+            incoming.cache_request_handle, CacheRequestOutcome.ABORT
+        )
         reason = self._sent_abort(s)
         self.assertEqual(reason["status_code"], HTTPStatus.TOO_MANY_REQUESTS)
-        s.metrics_collector.increment_rejected_requests.assert_called_once_with(reason="queue_full")
+        s.metrics_collector.increment_rejected_requests.assert_called_once_with(
+            reason="queue_full"
+        )
 
     def test_prefill_server_below_the_limit_admits(self):
-        s = self._scheduler(DisaggregationMode.PREFILL, max_queued=4, waiting=1, bootstrap=1, inflight=1)
+        s = self._scheduler(
+            DisaggregationMode.PREFILL, max_queued=4, waiting=1, bootstrap=1, inflight=1
+        )
         incoming = self._req()
         self._add(s, incoming)
         s.disagg_prefill_bootstrap_queue.add.assert_called_once_with(incoming, 1)
@@ -93,21 +105,33 @@ class TestPrefillServerQueueLimit(unittest.TestCase):
     def test_each_prefill_queue_counts(self):
         for waiting, bootstrap, inflight in ((2, 0, 0), (0, 2, 0), (0, 0, 2)):
             with self.subTest(waiting=waiting, bootstrap=bootstrap, inflight=inflight):
-                s = self._scheduler(DisaggregationMode.PREFILL, 2, waiting, bootstrap, inflight)
+                s = self._scheduler(
+                    DisaggregationMode.PREFILL, 2, waiting, bootstrap, inflight
+                )
                 self._add(s, self._req())
                 s.disagg_prefill_bootstrap_queue.add.assert_not_called()
 
     def test_priority_scheduling_never_evicts_on_a_prefill_server(self):
         # The waiting queue is empty, the bootstrap queue is full: reject the arrival, do not touch the queues.
-        s = self._scheduler(DisaggregationMode.PREFILL, max_queued=1, bootstrap=1, priority=True)
+        s = self._scheduler(
+            DisaggregationMode.PREFILL, max_queued=1, bootstrap=1, priority=True
+        )
         incoming = self._req(priority=100)
         self._add(s, incoming)
         self.assertEqual(len(s.disagg_prefill_bootstrap_queue.queue), 1)
         s.disagg_prefill_bootstrap_queue.add.assert_not_called()
-        self.assertEqual(self._sent_abort(s)["status_code"], HTTPStatus.TOO_MANY_REQUESTS)
+        self.assertEqual(
+            self._sent_abort(s)["status_code"], HTTPStatus.TOO_MANY_REQUESTS
+        )
 
     def test_no_limit_admits_everything(self):
-        s = self._scheduler(DisaggregationMode.PREFILL, max_queued=None, waiting=50, bootstrap=50, inflight=50)
+        s = self._scheduler(
+            DisaggregationMode.PREFILL,
+            max_queued=None,
+            waiting=50,
+            bootstrap=50,
+            inflight=50,
+        )
         incoming = self._req()
         self._add(s, incoming)
         s.disagg_prefill_bootstrap_queue.add.assert_called_once()
@@ -116,12 +140,16 @@ class TestPrefillServerQueueLimit(unittest.TestCase):
         s = self._scheduler(DisaggregationMode.DECODE, max_queued=1, waiting=5)
         incoming = self._req()
         self._add(s, incoming)
-        s.disagg_decode_prealloc_queue.add.assert_called_once_with(incoming, is_retracted=False)
+        s.disagg_decode_prealloc_queue.add.assert_called_once_with(
+            incoming, is_retracted=False
+        )
         s.ipc_channels.send_to_tokenizer.send_output.assert_not_called()
 
     def test_colocated_server_counts_only_its_waiting_queue(self):
         # NULL mode keeps its old behaviour; the PD queues are not consulted.
-        s = self._scheduler(DisaggregationMode.NULL, max_queued=2, waiting=1, bootstrap=5, inflight=5)
+        s = self._scheduler(
+            DisaggregationMode.NULL, max_queued=2, waiting=1, bootstrap=5, inflight=5
+        )
         incoming = self._req()
         self._add(s, incoming)
         self.assertIn(incoming, s.waiting_queue)

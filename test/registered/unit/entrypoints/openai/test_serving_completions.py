@@ -17,6 +17,7 @@ from unittest.mock import AsyncMock, Mock
 from fastapi import Request
 
 from sglang.srt.entrypoints.openai.protocol import CompletionRequest
+from sglang.srt.entrypoints.openai.serving_base import RequestAbortedError
 from sglang.srt.entrypoints.openai.serving_completions import OpenAIServingCompletion
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.runtime_context import get_context, publish, reset_context
@@ -253,7 +254,8 @@ class ServingCompletionTestCase(unittest.TestCase):
         self.assertEqual(response.choices[0].prompt_token_ids, [1, 2])
 
     def test_streaming_abort_yields_error(self):
-        """Test that an abort finish reason during streaming correctly yields an error and stops."""
+        """An abort before anything streamed raises RequestAbortedError, so the endpoint returns a real HTTP status
+        (e.g. 429 for a full queue) instead of HTTP 200 with an in-band error frame."""
         err_msg = "Aborted by scheduler"
         err_code = HTTPStatus.INTERNAL_SERVER_ERROR
 
@@ -296,29 +298,92 @@ class ServingCompletionTestCase(unittest.TestCase):
                     adapted_request, req, self.fastapi_request
                 ):
                     chunks.append(chunk)
-            except Exception as e:
-                print(f"Error during stream iteration: {e}")
-            return chunks
+            except RequestAbortedError as e:
+                return chunks, e
+            return chunks, None
 
         loop = get_or_create_event_loop()
-        chunks = loop.run_until_complete(run_stream())
+        chunks, aborted = loop.run_until_complete(run_stream())
 
-        error_chunk_data = None
-        for c in chunks:
-            if "error" in c:
-                error_chunk_data = json.loads(c[len("data: ") :])
-                break
-        self.assertIsNotNone(error_chunk_data, "Error chunk not found in stream")
+        self.assertEqual(chunks, [], "nothing may stream before a pre-stream abort")
+        self.assertIsNotNone(
+            aborted, "a pre-stream abort must raise RequestAbortedError"
+        )
+        self.assertEqual(aborted.status_code, err_code)
+        self.assertEqual(aborted.message, err_msg)
+
+    def test_streaming_abort_after_first_chunk_yields_error_frame(self):
+        """An abort after the stream started still ends it with an error frame and [DONE]."""
+        err_msg = "Aborted by scheduler"
+        err_code = HTTPStatus.INTERNAL_SERVER_ERROR
+
+        async def _mock_generate_abort(*args, **kwargs):
+            yield {
+                "text": "Partial ",
+                "meta_info": {
+                    "id": "cmpl-test",
+                    "prompt_tokens": 10,
+                    "completion_tokens": 2,
+                    "cached_tokens": 0,
+                    "finish_reason": None,
+                    "output_token_logprobs": [],
+                    "output_token_logprobs_length": 0,
+                    "output_top_logprobs": [],
+                },
+                "index": 0,
+            }
+            yield {
+                "text": "Partial more",
+                "meta_info": {
+                    "id": "cmpl-test",
+                    "prompt_tokens": 10,
+                    "completion_tokens": 2,
+                    "cached_tokens": 0,
+                    "finish_reason": {
+                        "type": "abort",
+                        "status_code": err_code,
+                        "message": err_msg,
+                    },
+                    "output_token_logprobs": [],
+                    "output_token_logprobs_length": 0,
+                    "output_top_logprobs": [],
+                },
+                "index": 0,
+            }
+
+        self.sc.tokenizer_manager.generate_request = _mock_generate_abort
+
+        req = CompletionRequest(
+            model="x",
+            prompt="Hello world",
+            max_tokens=100,
+            stream=True,
+            logprobs=5,
+        )
+
+        adapted_request, _ = self.sc._convert_to_internal_request(req)
+
+        async def run_stream():
+            chunks = []
+            try:
+                async for chunk in self.sc._generate_completion_stream(
+                    adapted_request, req, self.fastapi_request
+                ):
+                    chunks.append(chunk)
+            except RequestAbortedError as e:
+                return chunks, e
+            return chunks, None
+
+        loop = get_or_create_event_loop()
+        chunks, aborted = loop.run_until_complete(run_stream())
+
+        self.assertIsNone(aborted)
+        error_idx = next(i for i, c in enumerate(chunks) if '"error"' in c)
+        self.assertGreater(error_idx, 0, "content must stream before the abort")
+        error_chunk_data = json.loads(chunks[error_idx][len("data: ") :])
         self.assertEqual(error_chunk_data["error"]["message"], err_msg)
         self.assertEqual(error_chunk_data["error"]["code"], err_code.value)
-
-        # Ensure the stream stops after the abort error
-        # The last chunk should be "data: [DONE]\n\n"
         self.assertEqual(chunks[-1], "data: [DONE]\n\n")
-
-        # Check that there is an error chunk and a DONE chunk, and possibly a role chunk
-        self.assertGreaterEqual(len(chunks), 2)
-        self.assertIn("error", chunks[0])
 
     def test_echo_with_zero_logprobs_streaming(self):
         """logprobs=0 requests token logprobs without top-logprobs, so the
