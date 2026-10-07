@@ -1730,10 +1730,17 @@ def get_mm_http_session() -> requests.Session:
 
 # Raised by the loaders below when client-supplied media cannot be fetched or
 # decoded. ValueError is in the set because invalid base64 raises binascii.Error.
+# A path that does not exist or cannot be read and an image above PIL's pixel
+# limit are the client's input too (a 500 for them counts against uptime).
 CLIENT_MEDIA_EXCEPTIONS = (
     ValueError,
     UnidentifiedImageError,
     requests.exceptions.RequestException,
+    FileNotFoundError,
+    IsADirectoryError,
+    NotADirectoryError,
+    PermissionError,
+    Image.DecompressionBombError,
 )
 
 
@@ -2017,6 +2024,10 @@ def get_image_bytes(image_file: Union[str, bytes]) -> bytes:
     """Normalize various image inputs into raw bytes."""
     if isinstance(image_file, bytes):
         return image_file
+    if image_file.startswith("//"):
+        # A protocol-relative URL ("//host/path", as web pages embed images) names
+        # a remote image, not a local path: fetch it over https.
+        image_file = "https:" + image_file
     if image_file.startswith(("http://", "https://")):
         timeout = int(os.getenv("REQUEST_TIMEOUT", "3"))
         return download_remote_media(image_file, timeout=timeout)

@@ -58,6 +58,29 @@ class TestBadInputIsClientError(CustomTestCase):
                     ):
                         self._assert_client_error("https://media.host/clip", modality)
 
+    def test_missing_local_file(self):
+        for path in ("/no/such/dir/image.jpg", "/no/such/dir/image", "/"):
+            with self.subTest(path=path):
+                self._assert_client_error(path, Modality.IMAGE)
+
+    def test_decompression_bomb(self):
+        buf = io.BytesIO()
+        Image.new("1", (20000, 20000)).save(buf, "PNG")  # 400M pixels, > 2x PIL's limit
+        self._assert_client_error(buf.getvalue(), Modality.IMAGE)
+
+    def test_protocol_relative_url_is_fetched_over_https(self):
+        buf = io.BytesIO()
+        Image.new("RGB", (4, 4)).save(buf, "PNG")
+        with patch(
+            "sglang.srt.utils.common.download_remote_media", return_value=buf.getvalue()
+        ) as download:
+            img = _StubProcessor._load_single_item(
+                "//img.example.com/a/b.jpg", Modality.IMAGE
+            )
+        download.assert_called_once()
+        self.assertEqual(download.call_args.args[0], "https://img.example.com/a/b.jpg")
+        self.assertEqual(img.size, (4, 4))
+
     def test_invalid_base64(self):
         self._assert_client_error("!!!not-base64!!!", Modality.IMAGE)
 
