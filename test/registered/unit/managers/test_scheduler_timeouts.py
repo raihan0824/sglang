@@ -21,6 +21,7 @@ from sglang.test.test_utils import (
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
@@ -61,6 +62,8 @@ def _batch(reqs):
 
 def _scheduler(waiting_queue, running_reqs=(), last_batch_reqs=()):
     s = Scheduler.__new__(Scheduler)
+    s.disaggregation_mode = DisaggregationMode.NULL
+    s.metrics_collector = None
     s.waiting_queue = waiting_queue
     s.enable_hierarchical_cache = False
     s.enable_hicache_storage = False
