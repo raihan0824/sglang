@@ -3280,6 +3280,11 @@ class Scheduler(
             req.time_stats.set_wait_queue_entry_time()
             req.arrival_processed_tokens = self.processed_tokens_counter
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
+            # The prefill server is where a disaggregated request first waits, so the queue limit applies here
+            # (counted by _num_queued_for_limit); the decode server only gets requests the router also sent here.
+            if self._abort_on_queued_limit(req):
+                self._release_aborted_request(req)
+                return
             self._prefetch_kvcache(req)
             self.disagg_prefill_bootstrap_queue.add(
                 req, self.model_config.num_key_value_heads
@@ -3330,11 +3335,22 @@ class Scheduler(
         """Drop the cache-side state an aborted request left behind."""
         self.tree_cache.finish(req.cache_request_handle, CacheRequestOutcome.ABORT)
 
+    def _num_queued_for_limit(self) -> int:
+        """Requests counted against --max-queued-requests."""
+        num_queued = len(self.waiting_queue)
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            # A prefill server also holds requests waiting for a decode server to take them (bootstrap queue)
+            # and requests whose KV is still being sent (inflight queue). Counting them turns a busy prefill,
+            # a full decode side and a slow KV link alike into fast refusals instead of long waits.
+            num_queued += len(self.disagg_prefill_bootstrap_queue.queue)
+            num_queued += len(self.disagg_prefill_inflight_queue)
+        return num_queued
+
     def _abort_on_queued_limit(self, recv_req: Req) -> bool:
         """Abort an incoming or existing request if the waiting queue is full. Returns True if the incoming request is aborted."""
         if (
             self.max_queued_requests is None
-            or len(self.waiting_queue) + 1 <= self.max_queued_requests
+            or self._num_queued_for_limit() + 1 <= self.max_queued_requests
         ):
             return False
 
@@ -3342,7 +3358,12 @@ class Scheduler(
         req_to_abort = recv_req
         message = "The request queue is full."
         reason = "queue_full"
-        if self.enable_priority_scheduling:
+        # Only a colocated server may evict a waiting request for a higher-priority one: on a prefill server a
+        # waiting request has already been taken by a decode server, and its waiting queue can be empty here.
+        if (
+            self.enable_priority_scheduling
+            and self.disaggregation_mode == DisaggregationMode.NULL
+        ):
             # With priority scheduling, consider aboritng an existing request based on the priority.
             # direction = 1  => smaller number = higher priority; -1 => larger number = higher priority.
             # max(...) + (direction * priority, queue_time_start) picks the least-preferred request.
