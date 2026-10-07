@@ -1,8 +1,9 @@
 """--max-queued-requests on a disaggregated (PD) prefill server.
 
 The limit used to apply only in NULL mode, so a PD deployment queued without bound and never answered 429. On a
-prefill server it counts the waiting queue and the bootstrap queue (waiting for a decode server to take the request),
-not the inflight queue: those requests are already prefilled and only wait for their KV to be sent.
+prefill server it counts every request not yet handed to a decode server: the waiting queue, the bootstrap queue
+(waiting for a decode server to take the request) and the inflight queue (prefilled, waiting for or sending its KV;
+on a TCP KV link this is where requests pile up).
 """
 
 import unittest
@@ -109,10 +110,15 @@ class TestPrefillServerQueueLimit(unittest.TestCase):
                 self._add(s, self._req())
                 s.disagg_prefill_bootstrap_queue.add.assert_not_called()
 
-    def test_requests_sending_kv_do_not_count(self):
-        # Already prefilled, only waiting for the KV link: a new arrival does not queue behind them.
+    def test_requests_sending_kv_count(self):
+        # Prefilled but still waiting for the KV link: a new arrival's KV would queue behind theirs.
         s = self._scheduler(
-            DisaggregationMode.PREFILL, max_queued=2, waiting=1, inflight=8
+            DisaggregationMode.PREFILL, max_queued=8, waiting=1, inflight=7
+        )
+        self._add(s, self._req())
+        s.disagg_prefill_bootstrap_queue.add.assert_not_called()
+        s = self._scheduler(
+            DisaggregationMode.PREFILL, max_queued=9, waiting=1, inflight=7
         )
         incoming = self._req()
         self._add(s, incoming)
