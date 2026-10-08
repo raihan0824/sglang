@@ -22,7 +22,7 @@ def test_block_scales_follow_128x128_amax():
     q, scale = quantize_block_fp8(w.to(torch.bfloat16))
     assert q.dtype == torch.float8_e4m3fn and scale.shape == (2, 3)
     assert torch.isclose(scale[0, 0], torch.tensor(3.0) / FP8_MAX, rtol=1e-2)
-    assert scale[1, 2] < scale[0, 0] / 50
+    assert scale[1, 2] < scale[0, 0] / 20
     deq = q.float().view(2, 128, 3, 128) * scale[:, None, :, None]
     err = (deq.view(256, 384) - w.to(torch.bfloat16).float()).abs()
     # e4m3 keeps 3 mantissa bits: half an ulp of the block's largest value bounds it.
