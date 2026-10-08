@@ -54,6 +54,7 @@ from sglang.srt.layers.quantization.marlin_utils_fp4 import (
 from sglang.srt.layers.quantization.marlin_utils_fp8 import (
     prepare_fp8_layer_for_marlin,
 )
+from sglang.srt.layers.quantization.online_block_fp8 import OnlineBlockFp8LinearMethod
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.quantization.utils import (
     convert_to_channelwise,
@@ -1448,6 +1449,16 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
         return self.runner.run(dispatch_output, quant_info)
 
 
+def _is_online_fp8_projection(prefix: str) -> bool:
+    # Attention projections and shared experts of the language model; the router,
+    # the DSA indexer and the vision tower stay BF16.
+    return (
+        (".self_attn." in prefix or ".shared_experts." in prefix)
+        and ".indexer." not in prefix
+        and "visual" not in prefix
+    )
+
+
 class ModelOptFp4Config(ModelOptQuantConfig):
     """Supported ModelOpt FP4 paths:
 
@@ -1688,7 +1699,7 @@ class ModelOptFp4Config(ModelOptQuantConfig):
                 return ModelOptNvFp4FusedMoEMethod(self)
             return None
 
-        return self._get_quant_method(
+        method = self._get_quant_method(
             layer,
             prefix,
             Linear=(
@@ -1698,6 +1709,15 @@ class ModelOptFp4Config(ModelOptQuantConfig):
             ),
             Moe=ModelOptNvFp4FusedMoEMethod,
         )
+        min_tokens = envs.SGLANG_OPT_BF16_LINEAR_FP8_MIN_TOKENS.get()
+        if (
+            min_tokens > 0
+            and type(method) is UnquantizedLinearMethod
+            and isinstance(layer, LinearBase)
+            and _is_online_fp8_projection(prefix)
+        ):
+            return OnlineBlockFp8LinearMethod(min_tokens)
+        return method
 
 
 class HybridFp8NvFp4Config(Fp8Config):

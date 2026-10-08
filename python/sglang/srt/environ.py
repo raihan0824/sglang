@@ -1453,6 +1453,10 @@ class Envs:
     SGLANG_OPT_KDA_PREFILL_IN_GRAPH = EnvBool(False)
     SGLANG_OPT_KDA_PREFILL_IN_GRAPH_MAX_BS = EnvInt(64)
     SGLANG_OPT_KDA_PREFILL_IN_GRAPH_MAX_TRACK = EnvInt(4)
+    # ModelOpt NVFP4 checkpoints: give the BF16 attention projections and shared
+    # experts a load-time 128x128 block-FP8 copy used for batches of at least this
+    # many tokens (prefill); 0 keeps them BF16.
+    SGLANG_OPT_BF16_LINEAR_FP8_MIN_TOKENS = EnvInt(0)
 
     # ===================================================================
     # CUDA graphs and execution buffers
