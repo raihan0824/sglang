@@ -46,37 +46,51 @@ use crate::{
     },
 };
 
-/// A body wrapper that holds a token and returns it when the body is fully consumed or dropped.
-/// This ensures that for streaming responses, the token is only returned after the entire
-/// stream has been sent to the client.
-pub struct TokenGuardBody {
-    inner: Body,
+/// Owns tokens taken from the bucket and returns them when dropped.
+///
+/// Created right after the tokens are acquired, so they come back however the request ends:
+/// a finished or broken stream, or a client that disconnects before the worker has answered
+/// (the handler future is then dropped while it awaits the response, before any body exists).
+pub struct TokenGuard {
     /// The token bucket to return tokens to. Uses Option so we can take() on drop.
     token_bucket: Option<Arc<TokenBucket>>,
     /// Number of tokens to return.
     tokens: f64,
 }
 
-impl TokenGuardBody {
-    /// Create a new TokenGuardBody that will return tokens when dropped.
-    pub fn new(inner: Body, token_bucket: Arc<TokenBucket>, tokens: f64) -> Self {
+impl TokenGuard {
+    pub fn new(token_bucket: Arc<TokenBucket>, tokens: f64) -> Self {
         Self {
-            inner,
             token_bucket: Some(token_bucket),
             tokens,
         }
     }
 }
 
-impl Drop for TokenGuardBody {
+impl Drop for TokenGuard {
     fn drop(&mut self) {
         if let Some(bucket) = self.token_bucket.take() {
-            debug!(
-                "TokenGuardBody: stream ended, returning {} tokens to bucket",
-                self.tokens
-            );
+            debug!("TokenGuard: request ended, returning {} tokens to bucket", self.tokens);
             // Use lock-free sync return - no runtime needed, guaranteed token return
             bucket.return_tokens_sync(self.tokens);
+        }
+    }
+}
+
+/// A body wrapper that holds the request's token guard until the body is fully consumed or
+/// dropped, so for streaming responses the token is only returned after the entire stream has
+/// been sent to the client.
+pub struct TokenGuardBody {
+    inner: Body,
+    _guard: TokenGuard,
+}
+
+impl TokenGuardBody {
+    /// Create a new TokenGuardBody that returns the guard's tokens when dropped.
+    pub fn new(inner: Body, guard: TokenGuard) -> Self {
+        Self {
+            inner,
+            _guard: guard,
         }
     }
 }
@@ -434,7 +448,10 @@ impl QueueProcessor {
             if self.token_bucket.try_acquire(1.0).await.is_ok() {
                 // Got token immediately
                 debug!("Queue: acquired token immediately for queued request");
-                let _ = queued.permit_tx.send(Ok(()));
+                if queued.permit_tx.send(Ok(())).is_err() {
+                    // The request was dropped while it waited in the queue.
+                    self.token_bucket.return_tokens_sync(1.0);
+                }
             } else {
                 // Need to wait for token
                 let token_bucket = self.token_bucket.clone();
@@ -447,7 +464,10 @@ impl QueueProcessor {
                         .is_ok()
                     {
                         debug!("Queue: acquired token after waiting");
-                        let _ = queued.permit_tx.send(Ok(()));
+                        if queued.permit_tx.send(Ok(())).is_err() {
+                            // The request was dropped while it waited in the queue.
+                            token_bucket.return_tokens_sync(1.0);
+                        }
                     } else {
                         warn!("Queue: request timed out waiting for token");
                         let _ = queued.permit_tx.send(Err(StatusCode::REQUEST_TIMEOUT));
@@ -534,13 +554,15 @@ pub async fn concurrency_limit_middleware(
     if token_bucket.try_acquire(1.0).await.is_ok() {
         debug!("Acquired token immediately");
         Metrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_ALLOWED);
+        // Hold the token in a guard before awaiting the worker: a client that disconnects
+        // first drops this future, and the guard returns the token.
+        let guard = TokenGuard::new(token_bucket, 1.0);
         let response = next.run(request).await;
 
-        // Wrap the response body with TokenGuardBody to return token when stream ends
-        // This ensures that for streaming responses, the token is only returned
-        // after the entire stream has been sent to the client.
+        // Move the guard into the response body so a streaming response keeps the token
+        // until the entire stream has been sent to the client.
         let (parts, body) = response.into_parts();
-        let guarded_body = TokenGuardBody::new(body, token_bucket, 1.0);
+        let guarded_body = TokenGuardBody::new(body, guard);
         Response::from_parts(parts, Body::new(guarded_body))
     } else {
         // No tokens available, try to queue if enabled
@@ -567,6 +589,8 @@ pub async fn concurrency_limit_middleware(
                     match permit_rx.await {
                         Ok(Ok(())) => {
                             debug!("Acquired token from queue");
+                            // The queue processor acquired a token for this request.
+                            let guard = TokenGuard::new(token_bucket, 1.0);
                             Metrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_ALLOWED);
                             // Dequeue for embeddings
                             if is_embeddings {
@@ -577,7 +601,7 @@ pub async fn concurrency_limit_middleware(
 
                             // Wrap the response body with TokenGuardBody to return token when stream ends
                             let (parts, body) = response.into_parts();
-                            let guarded_body = TokenGuardBody::new(body, token_bucket, 1.0);
+                            let guarded_body = TokenGuardBody::new(body, guard);
                             Response::from_parts(parts, Body::new(guarded_body))
                         }
                         Ok(Err(status)) => {
