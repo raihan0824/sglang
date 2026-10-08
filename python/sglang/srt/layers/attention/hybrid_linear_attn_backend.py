@@ -66,6 +66,8 @@ class MambaAttnBackendBase(AttentionBackend):
     # by KDAAttnBackend where `_can_fuse_accept_state` holds. None everywhere
     # else — update_mamba_state_after_mtp_verify keys the fused branch on it.
     accept_lens_pool: Optional[torch.Tensor] = None
+    # KDAPrefillGraphState when KDA prefill runs inside the prefill graph.
+    prefill_graph_state = None
 
     def __init__(self, model_runner: ModelRunner):
         self.validate_mis_support(model_runner.server_args)
@@ -1251,6 +1253,20 @@ class HybridLinearAttnBackend(AttentionBackend):
         for attn_backend in self.attn_backend_list:
             attn_backend.update_verify_buffers_to_fill_after_draft(
                 spec_info=spec_info, cuda_graph_bs=cuda_graph_bs
+            )
+
+    def can_run_prefill_cuda_graph(self, forward_batch: ForwardBatch) -> bool:
+        state = self.linear_attn_backend.prefill_graph_state
+        return state is None or state.can_run(forward_batch)
+
+    def prepare_prefill_graph_static_metadata(
+        self, forward_batch: ForwardBatch, num_tokens: int
+    ) -> None:
+        """Fill the static prefill-graph buffers after init_forward_metadata."""
+        linear = self.linear_attn_backend
+        if linear.prefill_graph_state is not None:
+            linear.prefill_graph_state.fill(
+                forward_batch, linear.forward_metadata, num_tokens
             )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):

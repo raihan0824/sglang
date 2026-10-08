@@ -205,6 +205,13 @@ class AttentionBackend(ABC):
     def validate_elastic_cuda_graph_recapture(self) -> None:
         return
 
+    def prepare_prefill_graph_static_metadata(
+        self, forward_batch: ForwardBatch, num_tokens: int
+    ) -> None:
+        """Fill static per-bucket prefill-graph buffers after the eager
+        init_forward_metadata (capture and replay, bucket of ``num_tokens``)."""
+        return
+
     def init_forward_metadata_for_breakable_cuda_graph_capture(
         self,
         forward_batch: ForwardBatch,

@@ -1446,6 +1446,13 @@ class Envs:
     # mamba pool ratio accordingly. Frees one resident slot per running request,
     # raising max_running_requests. Off = original locking + ratio (escape hatch).
     SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK = EnvBool(False)
+    # Run KDA prefill inside the breakable prefill CUDA graph instead of as an
+    # eager break per layer: metadata lives in static per-bucket buffers padded
+    # to MAX_BS requests / MAX_TRACK prefix-cache snapshots; larger batches run
+    # the whole step eager. Off = one eager break per KDA layer.
+    SGLANG_OPT_KDA_PREFILL_IN_GRAPH = EnvBool(False)
+    SGLANG_OPT_KDA_PREFILL_IN_GRAPH_MAX_BS = EnvInt(64)
+    SGLANG_OPT_KDA_PREFILL_IN_GRAPH_MAX_TRACK = EnvInt(16)
 
     # ===================================================================
     # CUDA graphs and execution buffers

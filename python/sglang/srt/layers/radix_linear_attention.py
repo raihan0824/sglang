@@ -93,7 +93,21 @@ class RadixLinearAttention(nn.Module):
                 dtype=mixed_qkv.dtype,
                 device=mixed_qkv.device,
             )
-            if is_in_breakable_cuda_graph():
+            linear_backend = (
+                _linear_backend_with_prefill_graph()
+                if is_in_breakable_cuda_graph()
+                else None
+            )
+            if linear_backend is not None:
+                linear_backend.prefill_graph_state.forward_extend(
+                    backend=linear_backend,
+                    layer=self,
+                    mixed_qkv=mixed_qkv,
+                    a=a,
+                    b=b,
+                    output=output,
+                )
+            elif is_in_breakable_cuda_graph():
                 bcg_unified_linear_attention_with_output(
                     mixed_qkv,
                     a,
@@ -146,6 +160,21 @@ class RadixLinearAttention(nn.Module):
             a=a,
             b=b,
         )
+
+
+def _linear_backend_with_prefill_graph():
+    """The KDA backend when its prefill runs inside the breakable graph."""
+    from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+        HybridLinearAttnBackend,
+    )
+
+    backend = get_attn_backend()
+    if (
+        isinstance(backend, HybridLinearAttnBackend)
+        and backend.linear_attn_backend.prefill_graph_state is not None
+    ):
+        return backend.linear_attn_backend
+    return None
 
 
 def _linear_attention_with_output_impl(

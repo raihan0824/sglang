@@ -13,12 +13,16 @@ from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBack
 from sglang.srt.layers.attention.linear.kernels.kda_flashinfer import (
     build_fused_accept_indices,
 )
+from sglang.srt.layers.attention.linear.kda_prefill_graph import (
+    maybe_create_prefill_graph_state,
+)
 from sglang.srt.layers.attention.linear.kernels.kda_triton import TritonKDAKernel
 from sglang.srt.layers.attention.linear.utils import (
     LinearAttnKernelBackend,
     build_verify_intermediate_state_indices,
 )
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
+from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.utils import is_cpu, is_cuda, is_npu
 from sglang.srt.utils.common import is_gfx95_supported, rank0_log
 
@@ -467,6 +471,14 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 dtype=torch.int32,
                 device=model_runner.device,
             )
+        prefill_cg = get_exec().graph.cuda_graph_config.prefill
+        self.prefill_graph_state = (
+            maybe_create_prefill_graph_state(self, max(prefill_cg.bs))
+            if prefill_cg.backend == Backend.BREAKABLE
+            and prefill_cg.bs
+            and not model_runner.is_draft_worker
+            else None
+        )
 
     @staticmethod
     def _can_fuse_accept_state(verify_backend) -> bool:
