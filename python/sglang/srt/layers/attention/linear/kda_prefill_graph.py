@@ -141,7 +141,6 @@ class KDAPrefillGraphState:
         self.track_chunk_idx = torch.full(
             (n_seqs,), -1, dtype=torch.int32, device=device
         )
-        self.row_mask = torch.zeros(max_num_tokens, dtype=torch.bfloat16, device=device)
         self.conv_dst = torch.full(
             (max_track,), self.pad_slot, dtype=torch.int64, device=device
         )
@@ -210,7 +209,6 @@ class KDAPrefillGraphState:
             lens, num_tokens, self.max_bs
         )
         n_seqs = qsl.shape[0] - 1
-        t_real = sum(lens)
         nb = True
         self.qsl[: n_seqs + 1].copy_(qsl, non_blocking=nb)
         self.chunk_indices[: chunks.shape[0]].copy_(chunks, non_blocking=nb)
@@ -223,8 +221,6 @@ class KDAPrefillGraphState:
         self.cache_indices[:bs].copy_(metadata.mamba_cache_indices[:bs])
         self.cache_indices[bs].fill_(self.pad_slot)
         self.cache_indices[bs + 1 : n_seqs].fill_(-1)
-        self.row_mask[:t_real].fill_(1)
-        self.row_mask[t_real:num_tokens].zero_()
 
         self.track_chunk_idx[:n_seqs].fill_(-1)
         n_conv = n_h = n_fin = 0
@@ -263,8 +259,8 @@ class KDAPrefillGraphState:
         b: torch.Tensor,
         output: torch.Tensor,
     ) -> None:
-        """KDA extend over the whole bucket with static shapes; writes ``output``
-        (zero on padding rows). Captured into the prefill graph."""
+        """KDA extend over the whole bucket with static shapes into ``output``.
+        Captured into the prefill graph."""
         num_tokens = mixed_qkv.shape[0]
         n_seqs = bucket_num_seqs(self.max_bs, num_tokens)
         n_chunks = bucket_num_chunks(self.max_bs, num_tokens)
@@ -326,11 +322,8 @@ class KDAPrefillGraphState:
         # buffer, aligned rows from the final state.
         ssm_states[self.h_dst] = track_buf[self.h_src].to(ssm_states.dtype)
         ssm_states[self.final_dst] = ssm_states[self.final_src]
-        torch.mul(
-            core_attn_out,
-            self.row_mask[:num_tokens].view(1, num_tokens, 1, 1),
-            out=output,
-        )
+        # Pad rows keep finite pad-sequence values; nothing reads them into a real row.
+        output.copy_(core_attn_out)
 
 
 def maybe_create_prefill_graph_state(
