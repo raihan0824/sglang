@@ -15,6 +15,9 @@ from sglang.kernels.jit.utils import is_arch_support_pdl
 PAD_SLOT_ID = -1
 
 
+CONV_FWD_BLOCK_M = 8
+
+
 @triton.jit()
 def _causal_conv1d_fwd_kernel(  # continuous batching
     # Pointers to matrices
@@ -26,6 +29,7 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
     has_initial_states_ptr,
     query_start_loc_ptr,
     o_ptr,  # (dim, seqlen) - actually pointing to x_ptr
+    block_indices_ptr,  # [num_blocks, 2] (seq, token block) when HAS_BLOCK_INDICES
     # Matrix dimensions
     dim: tl.constexpr,
     seqlen: tl.int32,  # cu_seqlen
@@ -55,6 +59,7 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
     NP2_STATELEN: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    HAS_BLOCK_INDICES: tl.constexpr = False,
 ):
     conv_states_ptr = initial_states_ptr
     conv_state_indices_ptr = cache_indices_ptr
@@ -69,8 +74,13 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
     # rather than mixing sequences - to make updating initial_states across sequences efficiently
 
     # single-sequence id
-    idx_seq = tl.program_id(0)
-    chunk_offset = tl.program_id(1)
+    if HAS_BLOCK_INDICES:
+        # Static-grid callers list the (sequence, token block) pairs explicitly.
+        idx_seq = tl.load(block_indices_ptr + tl.program_id(0) * 2)
+        chunk_offset = tl.load(block_indices_ptr + tl.program_id(0) * 2 + 1)
+    else:
+        idx_seq = tl.program_id(0)
+        chunk_offset = tl.program_id(1)
 
     # BLOCK_N elements along the feature-dimension (channel)
     idx_feats = tl.program_id(2) * BLOCK_N + tl.arange(0, BLOCK_N)
@@ -402,9 +412,14 @@ def causal_conv1d_fn(
     activation: Optional[str] = "silu",
     pad_slot_id: int = PAD_SLOT_ID,
     validate_data=False,
+    block_indices: Optional[torch.Tensor] = None,
     **kwargs,
 ):
     """support varlen + continuous batching when x is 2D tensor
+
+    block_indices: optional [num_blocks, 2] int32 (sequence, CONV_FWD_BLOCK_M-token
+        block) pairs; the grid then covers exactly these blocks (pairs past a
+        sequence's end are no-ops), so the launch shape is fixed by the caller.
 
     x: (dim,cu_seq_len)
         cu_seq_len = total tokens of all seqs in that batch
@@ -515,6 +530,8 @@ def causal_conv1d_fn(
         assert is_channel_last, "Need to run in channel-last layout"
 
     def grid(META):
+        if block_indices is not None:
+            return (block_indices.shape[0], 1, triton.cdiv(dim, META["BLOCK_N"]))
         max_seq_len = max(seq_lens_cpu)
         return (
             len(seq_lens_cpu),  # batch_size
@@ -532,6 +549,7 @@ def causal_conv1d_fn(
         has_initial_state,
         query_start_loc,
         out,
+        block_indices,
         # Matrix dimensions
         dim,
         cu_seqlen,
@@ -560,9 +578,10 @@ def causal_conv1d_fn(
         USE_PAD_SLOT=pad_slot_id is not None,
         NP2_STATELEN=np2_statelen,
         # launch_cooperative_grid=True
-        BLOCK_M=8,
+        BLOCK_M=CONV_FWD_BLOCK_M,
         BLOCK_N=256,
         num_stages=2,
+        HAS_BLOCK_INDICES=block_indices is not None,
     )
     return out
 

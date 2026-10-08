@@ -133,13 +133,16 @@ def _reference(pool, layer, mixed, a, b, lens, prefix, slots, track_chunk):
 
 class TestKdaPrefillStaticGraph(CustomTestCase):
     def test_layout(self):
-        qsl, chunks, offsets = build_static_layout([100, 37, 700], 1024, max_bs=8)
+        qsl, chunks, offsets, blocks = build_static_layout([100, 37, 700], 1024, max_bs=8)
         n = bucket_num_seqs(8, 1024)
         self.assertEqual(qsl.tolist()[:6], [0, 100, 137, 837, 1024, 1024])
         self.assertEqual(qsl.shape[0], n + 1)
         self.assertEqual(offsets.tolist()[:5], [0, 2, 3, 14, 17])
-        # Padding chunks are chunk 0 of the last, empty sequence.
+        # Padding chunks and conv blocks are block 0 of the last, empty sequence.
         self.assertEqual(chunks[-1].tolist(), [n - 1, 0])
+        self.assertEqual(blocks[-1].tolist(), [n - 1, 0])
+        self.assertEqual(blocks[12].tolist(), [0, 12])  # ceil(100 / 8) blocks for seq 0
+        self.assertEqual(blocks[13].tolist(), [1, 0])
         self.assertEqual(int(qsl[-1] - qsl[-2]), 0)
 
     @torch.inference_mode()

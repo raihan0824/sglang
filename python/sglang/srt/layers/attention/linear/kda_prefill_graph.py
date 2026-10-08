@@ -13,10 +13,11 @@ Static layout for a bucket of ``T`` tokens (``bs_cap = min(max_bs, T)``):
 * sequences ``(bs, bs_cap + 2)`` have zero length,
 
 so there are always ``bs_cap + 2`` sequences and at least one empty one. The pad
-and empty sequences use the reserved padding mamba slot, whose SSM state is
-zeroed before each layer. The chunk list is padded to a static length with chunk
-0 of the last (empty) sequence, which every kernel treats as a no-op. Prefix
-cache snapshots are padded to ``max_track`` copies into the padding slot.
+sequence uses the reserved padding mamba slot, whose SSM state is zeroed before
+each layer; empty sequences carry slot -1, which the kernels skip. The chunk and
+conv block lists are padded to a static length with block 0 of the last (empty)
+sequence, a no-op in every kernel. Prefix cache snapshots are padded to
+``max_track`` copies into the padding slot.
 Batches beyond the static limits run the whole step eager
 (``can_run_prefill_cuda_graph``).
 """
@@ -29,7 +30,10 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.kernels.ops.mamba.causal_conv1d_triton import causal_conv1d_fn
+from sglang.kernels.ops.mamba.causal_conv1d_triton import (
+    CONV_FWD_BLOCK_M,
+    causal_conv1d_fn,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.linear.kda_backend import KDAAttnBackend
@@ -49,9 +53,15 @@ def bucket_num_seqs(max_bs: int, num_tokens: int) -> int:
     return bucket_bs_cap(max_bs, num_tokens) + 2
 
 
-def bucket_num_chunks(max_bs: int, num_tokens: int) -> int:
-    # Real chunks <= T_real/64 + bs, pad chunks <= pad/64 + 1.
-    return num_tokens // CHUNK_SIZE + bucket_bs_cap(max_bs, num_tokens) + 2
+def bucket_num_chunks(max_bs: int, num_tokens: int, chunk: int = CHUNK_SIZE) -> int:
+    # Real chunks <= T_real/chunk + bs, pad chunks <= pad/chunk + 1.
+    return num_tokens // chunk + bucket_bs_cap(max_bs, num_tokens) + 2
+
+
+def _block_list(lens: list[int], block: int, total: int) -> list[tuple[int, int]]:
+    out = [(i, t) for i, n in enumerate(lens) for t in range(math.ceil(n / block))]
+    assert len(out) <= total, (len(out), total)
+    return out + [(len(lens) - 1, 0)] * (total - len(out))
 
 
 def build_static_layout(
@@ -59,11 +69,8 @@ def build_static_layout(
     num_tokens: int,
     max_bs: int,
 ):
-    """CPU part of the static metadata: qsl, chunk indices and chunk offsets.
-
-    Returns int32 tensors ``(qsl[N+1], chunk_indices[NT, 2], chunk_offsets[N+1])``
-    for ``N = bucket_num_seqs`` sequences and ``NT = bucket_num_chunks`` chunks.
-    """
+    """CPU part of the static metadata: int32 ``qsl[N+1]``, ``chunk_indices[NT, 2]``,
+    ``chunk_offsets[N+1]`` and conv ``block_indices[NB, 2]`` for the bucket."""
     bs = len(extend_seq_lens)
     bs_cap = bucket_bs_cap(max_bs, num_tokens)
     n_seqs = bs_cap + 2
@@ -73,18 +80,18 @@ def build_static_layout(
     lens = list(extend_seq_lens) + [num_tokens - t_real] + [0] * (n_seqs - bs - 1)
     qsl = [0]
     offsets = [0]
-    chunks = []
-    for i, n in enumerate(lens):
+    for n in lens:
         qsl.append(qsl[-1] + n)
-        nc = math.ceil(n / CHUNK_SIZE)
-        offsets.append(offsets[-1] + nc)
-        chunks.extend((i, t) for t in range(nc))
-    assert len(chunks) <= n_chunks, (len(chunks), n_chunks)
-    chunks.extend([(n_seqs - 1, 0)] * (n_chunks - len(chunks)))
+        offsets.append(offsets[-1] + math.ceil(n / CHUNK_SIZE))
+    chunks = _block_list(lens, CHUNK_SIZE, n_chunks)
+    blocks = _block_list(
+        lens, CONV_FWD_BLOCK_M, bucket_num_chunks(max_bs, num_tokens, CONV_FWD_BLOCK_M)
+    )
     return (
         torch.tensor(qsl, dtype=torch.int32),
         torch.tensor(chunks, dtype=torch.int32),
         torch.tensor(offsets, dtype=torch.int32),
+        torch.tensor(blocks, dtype=torch.int32),
     )
 
 
@@ -125,6 +132,12 @@ class KDAPrefillGraphState:
         self.has_initial_state = torch.zeros(n_seqs, dtype=torch.bool, device=device)
         self.chunk_indices = torch.zeros(n_chunks, 2, dtype=torch.int32, device=device)
         self.chunk_offsets = torch.zeros(n_seqs + 1, dtype=torch.int32, device=device)
+        self.conv_blocks = torch.zeros(
+            bucket_num_chunks(max_bs, max_num_tokens, CONV_FWD_BLOCK_M),
+            2,
+            dtype=torch.int32,
+            device=device,
+        )
         self.track_chunk_idx = torch.full(
             (n_seqs,), -1, dtype=torch.int32, device=device
         )
@@ -193,19 +206,23 @@ class KDAPrefillGraphState:
         bs = forward_batch.batch_size
         lens = list(forward_batch.extend_seq_lens_cpu)
         prefix = forward_batch.extend_prefix_lens_cpu
-        qsl, chunks, offsets = build_static_layout(lens, num_tokens, self.max_bs)
+        qsl, chunks, offsets, blocks = build_static_layout(
+            lens, num_tokens, self.max_bs
+        )
         n_seqs = qsl.shape[0] - 1
         t_real = sum(lens)
         nb = True
         self.qsl[: n_seqs + 1].copy_(qsl, non_blocking=nb)
         self.chunk_indices[: chunks.shape[0]].copy_(chunks, non_blocking=nb)
         self.chunk_offsets[: n_seqs + 1].copy_(offsets, non_blocking=nb)
+        self.conv_blocks[: blocks.shape[0]].copy_(blocks, non_blocking=nb)
         self.has_initial_state[:n_seqs].copy_(
             torch.tensor([p > 0 for p in prefix] + [False] * (n_seqs - bs)),
             non_blocking=nb,
         )
         self.cache_indices[:bs].copy_(metadata.mamba_cache_indices[:bs])
-        self.cache_indices[bs:n_seqs].fill_(self.pad_slot)
+        self.cache_indices[bs].fill_(self.pad_slot)
+        self.cache_indices[bs + 1 : n_seqs].fill_(-1)
         self.row_mask[:t_real].fill_(1)
         self.row_mask[t_real:num_tokens].zero_()
 
@@ -273,6 +290,9 @@ class KDAPrefillGraphState:
             cache_indices=cache_indices,
             has_initial_state=self.has_initial_state[:n_seqs],
             activation="silu",
+            block_indices=self.conv_blocks[
+                : bucket_num_chunks(self.max_bs, num_tokens, CONV_FWD_BLOCK_M)
+            ],
         ).transpose(0, 1)
         q, k, v = qkv.split([layer.q_dim, layer.k_dim, layer.v_dim], dim=-1)
         q = q.unflatten(-1, (-1, layer.head_q_dim)).unsqueeze(0)

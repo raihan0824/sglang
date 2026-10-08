@@ -553,6 +553,9 @@ def _recompute_w_u_fwd_kernel(
         T = eos - bos
     else:
         bos, eos = i_b * T, i_b * T + T
+    # Static-grid callers pad the chunk list with chunks past a sequence's end.
+    if i_t * BT >= T:
+        return
     p_b = tl.make_block_ptr(beta + bos * H + i_h, (T,), (H,), (i_t * BT,), (BT,), (0,))
     b_b = tl.load(p_b, boundary_check=(0,))
 
@@ -795,6 +798,9 @@ def chunk_gla_fwd_kernel_o(
         NT = tl.cdiv(T, BT)
         i_tg = i_b * NT + i_t
         bos, eos = i_b * T, i_b * T + T
+    # Static-grid callers pad the chunk list with chunks past a sequence's end.
+    if i_t * BT >= T:
+        return
 
     m_s = tl.arange(0, BT)[:, None] >= tl.arange(0, BT)[None, :]
 
@@ -971,6 +977,9 @@ def kda_gate_chunk_cumsum_vector_kernel(
         T = eos - bos
     else:
         bos, eos = i_b * T, i_b * T + T
+    # Static-grid callers pad the chunk list with chunks past a sequence's end.
+    if i_t * BT >= T:
+        return
 
     p_s = tl.make_block_ptr(
         s + (bos * H + i_h) * S,

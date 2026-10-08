@@ -1452,7 +1452,7 @@ class Envs:
     # the whole step eager. Off = one eager break per KDA layer.
     SGLANG_OPT_KDA_PREFILL_IN_GRAPH = EnvBool(False)
     SGLANG_OPT_KDA_PREFILL_IN_GRAPH_MAX_BS = EnvInt(64)
-    SGLANG_OPT_KDA_PREFILL_IN_GRAPH_MAX_TRACK = EnvInt(16)
+    SGLANG_OPT_KDA_PREFILL_IN_GRAPH_MAX_TRACK = EnvInt(4)
 
     # ===================================================================
     # CUDA graphs and execution buffers
