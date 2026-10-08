@@ -22,7 +22,10 @@ from sglang.kernels.ops.attention.fla.fused_recurrent import (
 from sglang.kernels.ops.attention.fla.index import (
     prepare_chunk_indices,
 )
-from sglang.kernels.ops.attention.fla.l2norm import l2norm_fwd
+from sglang.kernels.ops.attention.fla.l2norm import (
+    kda_prefill_qkv_l2norm_prepare,
+    l2norm_fwd,
+)
 from sglang.kernels.ops.attention.fla.op import exp, exp2, log
 from sglang.kernels.ops.attention.fla.utils import (
     autotune_cache_kwargs,
@@ -1261,6 +1264,19 @@ def chunk_kda_fwd(
     return o
 
 
+def _is_packed_qkv(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> bool:
+    """[1, T, H, D] Q/K/V views into one token-major buffer (the KDA conv output)."""
+    return (
+        q.shape[0] == 1
+        and q.shape == k.shape
+        and v.shape[:2] == q.shape[:2]
+        and v.shape[-1] == q.shape[-1]
+        and q.shape[-1] <= 512
+        and not (q.is_contiguous() and k.is_contiguous())
+        and all(x.stride(-1) == 1 and x.stride(-2) == x.shape[-1] for x in (q, k, v))
+    )
+
+
 def chunk_kda(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1286,7 +1302,12 @@ def chunk_kda(
     if scale is None:
         scale = k.shape[-1] ** -0.5
 
-    if use_qk_l2norm_in_kernel:
+    if use_qk_l2norm_in_kernel and _is_packed_qkv(q, k, v):
+        q, k, v = (
+            x.unsqueeze(0)
+            for x in kda_prefill_qkv_l2norm_prepare(q[0], k[0], v[0])
+        )
+    elif use_qk_l2norm_in_kernel:
         q = l2norm_fwd(q.contiguous())
         k = l2norm_fwd(k.contiguous())
 

@@ -137,13 +137,16 @@ def gdn_prefill_qkv_prepare_kernel(
     v_stride_h,
     v_stride_d,
     T,
+    eps,
     H_QK: tl.constexpr,
     H_V: tl.constexpr,
     D: tl.constexpr,
     BT: tl.constexpr,
     BD: tl.constexpr,
+    NORM_QK: tl.constexpr = False,
 ):
-    """Materialize strided Q/K/V into token-major tensors in one launch."""
+    """Materialize strided Q/K/V into token-major tensors in one launch
+    (with NORM_QK, Q and K come out L2-normalized as by l2norm_fwd_kernel)."""
     token_block = tl.program_id(0)
     head_idx = tl.program_id(1)
 
@@ -168,6 +171,11 @@ def gdn_prefill_qkv_prepare_kernel(
         )
         q_values = tl.load(q_block, boundary_check=(0, 1)).to(tl.float32)
         k_values = tl.load(k_block, boundary_check=(0, 1)).to(tl.float32)
+        if NORM_QK:
+            q_var = tl.sum(q_values * q_values, axis=1)
+            q_values = q_values / tl.sqrt(q_var + eps)[:, None]
+            k_var = tl.sum(k_values * k_values, axis=1)
+            k_values = k_values / tl.sqrt(k_var + eps)[:, None]
         q_output_block = tl.make_block_ptr(
             q_out + head_idx * D,
             (T, D),
@@ -269,6 +277,7 @@ def gdn_prefill_qkv_prepare_fwd(
         v.stride(1),
         v.stride(2),
         T=T,
+        eps=eps,
         H_QK=H_QK,
         H_V=H_V,
         D=D,
@@ -278,6 +287,53 @@ def gdn_prefill_qkv_prepare_fwd(
         num_stages=2,
     )
     return l2norm_fwd(q_out, eps), l2norm_fwd(k_out, eps), v_out
+
+
+def kda_prefill_qkv_l2norm_prepare(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    eps: float = 1e-6,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Strided [T, H, D] Q/K/V (views into the packed conv output) to contiguous
+    L2-normalized Q, K and contiguous V in one launch; bitwise equal to
+    l2norm_fwd(q.contiguous()), l2norm_fwd(k.contiguous()), v.contiguous()."""
+    T, H_QK, D = q.shape
+    H_V = v.shape[1]
+    q_out = torch.empty(q.shape, dtype=q.dtype, device=q.device)
+    k_out = torch.empty(k.shape, dtype=k.dtype, device=k.device)
+    v_out = torch.empty(v.shape, dtype=v.dtype, device=v.device)
+    # BT / BD / warps match l2norm_fwd so the reduction order is the same.
+    BT = 16
+    BD = triton.next_power_of_2(D)
+    gdn_prefill_qkv_prepare_kernel[(triton.cdiv(T, BT), H_QK + H_V)](
+        q,
+        k,
+        v,
+        q_out,
+        k_out,
+        v_out,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        k.stride(0),
+        k.stride(1),
+        k.stride(2),
+        v.stride(0),
+        v.stride(1),
+        v.stride(2),
+        T=T,
+        eps=eps,
+        H_QK=H_QK,
+        H_V=H_V,
+        D=D,
+        BT=BT,
+        BD=BD,
+        NORM_QK=True,
+        num_warps=8,
+        num_stages=3,
+    )
+    return q_out, k_out, v_out
 
 
 class L2NormFunction(torch.autograd.Function):
