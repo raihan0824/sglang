@@ -94,7 +94,7 @@ from sglang.srt.speculative.spec_utils import (
     draft_tp_context,
 )
 from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
-from sglang.srt.utils.common import empty_context
+from sglang.srt.utils.common import async_h2d, empty_context
 
 _is_npu = is_npu()
 
@@ -2304,9 +2304,11 @@ class DFlashWorkerV2(BaseSpecWorker):
 
             # Materialize prompt tokens into the draft KV cache immediately. This is required
             # for radix cache safety (the scheduler may update radix after prefill returns).
+            # Pinned, non-blocking copies (as in DSpark): a pageable copy here would
+            # block the host until the forward stream drains.
             device = next_token_ids.device
-            ctx_lens = torch.tensor(batch.extend_lens, dtype=torch.int32, device=device)
-            draft_seq_lens = torch.tensor(
+            ctx_lens = async_h2d(batch.extend_lens, dtype=torch.int32, device=device)
+            draft_seq_lens = async_h2d(
                 batch.prefix_lens, dtype=torch.int32, device=device
             )
 

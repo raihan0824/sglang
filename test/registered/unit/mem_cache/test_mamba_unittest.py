@@ -18,6 +18,7 @@ from sglang.srt.mem_cache.memory_pool import (
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.srt.utils import get_device
+from sglang.srt.utils.common import async_h2d
 from sglang.test.ci.ci_register import (
     register_amd_ci,
     register_cuda_ci,
@@ -170,6 +171,66 @@ class TestMamba(unittest.TestCase):
             req_to_token_pool.mamba_allocator.available_size() == mamba_cache_size - 1
         )
 
+    @unittest.skipUnless(torch.cuda.is_available(), "host-sync checks need CUDA")
+    def test_prefill_slot_setup_does_not_sync_host(self):
+        """Under the overlap schedule the scheduler clears and maps mamba slots for
+        a new prefill while the previous forward is still running; a host sync
+        there drains that forward."""
+        _, req_to_token_pool, _ = self._setup_pools(enable_mamba_extra_buffer=True)
+        mamba_pool = req_to_token_pool.mamba_pool
+        self.assertTrue(mamba_pool._should_fuse_slot_ops())
+        temporal = mamba_pool.mamba_cache.temporal
+        temporal.fill_(1)
+        slots = req_to_token_pool.mamba_allocator.alloc(3)
+        reqs = [
+            Req(
+                rid=i,
+                origin_input_text="",
+                origin_input_ids=array("q"),
+                sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
+            )
+            for i in range(2)
+        ]
+        # The first call builds the cached conv-slot descriptor (a one-time copy).
+        warm = req_to_token_pool.mamba_allocator.alloc(1)
+        mamba_pool.clear_slots(warm)
+        temporal.fill_(1)
+        torch.cuda.synchronize()
+        torch.cuda.set_sync_debug_mode("error")
+        try:
+            mamba_pool.clear_slots(slots)
+            select_index = req_to_token_pool.alloc(reqs)
+            lens = async_h2d([3, 0, 7], dtype=torch.int32, device=temporal.device)
+        finally:
+            torch.cuda.set_sync_debug_mode("default")
+
+        cleared = torch.zeros(
+            temporal.shape[1], dtype=torch.bool, device=temporal.device
+        )
+        cleared[slots] = True
+        self.assertTrue(torch.all(temporal[:, cleared] == 0))
+        self.assertTrue(torch.all(temporal[:, ~cleared] == 1))
+        expected = torch.stack([req.kv.mamba_pool_idx for req in reqs]).to(torch.int32)
+        self.assertTrue(
+            torch.equal(
+                req_to_token_pool.req_index_to_mamba_index_mapping[select_index],
+                expected,
+            )
+        )
+        ping_pong = torch.stack([req.kv.mamba_ping_pong_track_buffer for req in reqs])
+        self.assertTrue(
+            torch.equal(
+                req_to_token_pool.req_index_to_mamba_ping_pong_track_buffer_mapping[
+                    select_index
+                ],
+                ping_pong.to(
+                    req_to_token_pool.req_index_to_mamba_ping_pong_track_buffer_mapping.dtype
+                ),
+            )
+        )
+        self.assertEqual(lens.dtype, torch.int32)
+        self.assertEqual(lens.tolist(), [3, 0, 7])
+
     def test_mamba_pool_deduplicated_conv_window_axis(self):
         class WindowFirstMambaPool(MambaPool):
             conv_window_axis = 0
@@ -227,7 +288,7 @@ class TestMamba(unittest.TestCase):
         view[0, 0, 0, 1, 0] = -1
         self.assertEqual(view[0, 0, 1, 0, 0].item(), -1)
 
-    def _setup_pools(self):
+    def _setup_pools(self, enable_mamba_extra_buffer: bool = False):
         """Build the hybrid req/KV pools and an allocator for pool-level tests."""
         server_args = ServerArgs(model_path="dummy", page_size=1)
         # The mamba pool reads mamba_cache_chunk_size, whose property otherwise
@@ -272,7 +333,7 @@ class TestMamba(unittest.TestCase):
             enable_memory_saver=False,
             cache_params=mamba2_cache_params,
             mamba_layer_ids=mamba_layers,
-            enable_mamba_extra_buffer=False,
+            enable_mamba_extra_buffer=enable_mamba_extra_buffer,
             speculative_num_draft_tokens=3,
         )
         pool = HybridLinearKVPool(
