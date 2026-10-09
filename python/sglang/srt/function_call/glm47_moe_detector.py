@@ -6,6 +6,7 @@ from functools import lru_cache
 from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
 from sglang.srt.entrypoints.openai.protocol import Tool, ToolChoice
+from sglang.srt.environ import envs
 from sglang.srt.function_call.base_format_detector import (
     BaseFormatDetector,
     StructuralTag,
@@ -333,6 +334,7 @@ class Glm47MoeDetector(BaseFormatDetector):
         self._sent_empty_object = (
             False  # Track if empty object has been sent for no-arg functions
         )
+        self._skipping_undeclared_tool = False
         self._reset_streaming_state()
 
     def _reset_streaming_state(self) -> None:
@@ -580,6 +582,19 @@ class Glm47MoeDetector(BaseFormatDetector):
             logger.warning("Empty function name detected, skipping tool call")
             return None
 
+        if (
+            func_name not in self._tool_indices
+            and not envs.SGLANG_FORWARD_UNKNOWN_TOOLS.get()
+        ):
+            # Same rule as parse_base_json on the non-streaming path: drop the
+            # call through its </tool_call> rather than stream a name the
+            # request never declared.
+            logger.warning(f"Model attempted to call undefined function: {func_name}")
+            self._skipping_undeclared_tool = True
+            del self.prev_tool_call_arr[self.current_tool_id :]
+            del self.streamed_args_for_tool[self.current_tool_id :]
+            return None
+
         # Send tool name
         self.current_tool_name_sent = True
         self._streamed_raw_length = 0
@@ -812,6 +827,13 @@ class Glm47MoeDetector(BaseFormatDetector):
                 partial_match
             )
 
+            if self._skipping_undeclared_tool:
+                if is_tool_end == self.eot_token:
+                    self._buffer = current_text[partial_match.end() :]
+                    self._skipping_undeclared_tool = False
+                    self._reset_streaming_state()
+                return StreamingParseResult(normal_text=normal_text, calls=[])
+
             # Initialize tool call state if needed (keeping existing logic)
             if self.current_tool_id == -1:
                 self.current_tool_id = 0
@@ -845,6 +867,15 @@ class Glm47MoeDetector(BaseFormatDetector):
             )
             if tool_name_item:
                 calls.append(tool_name_item)
+            elif self._skipping_undeclared_tool:
+                # The name was just rejected; if the call already closed in
+                # this buffer, consume it now so a following call (or the end
+                # of the stream) does not see it again.
+                if is_tool_end == self.eot_token:
+                    self._buffer = current_text[partial_match.end() :]
+                    self._skipping_undeclared_tool = False
+                    self._reset_streaming_state()
+                return StreamingParseResult(normal_text=normal_text, calls=calls)
 
             # Process streaming arguments if tool name has been sent
             if self.current_tool_name_sent:
@@ -871,6 +902,30 @@ class Glm47MoeDetector(BaseFormatDetector):
             return StreamingParseResult(normal_text=current_text)
 
         return StreamingParseResult(normal_text=normal_text, calls=calls)
+
+    def finish(self, tools: List[Tool]) -> StreamingParseResult:
+        """Release text held for a <tool_call> that never got a name.
+
+        detect_and_parse leaves an incomplete call in the text. Streaming held it
+        waiting for a name, so at the end of the stream it is returned the same
+        way, and its placeholder is dropped so the end-of-stream argument flush
+        does not send ``{}`` for a call that has no name.
+
+        A call whose name already streamed is a truncated call: its markup went
+        out as tool-call deltas and is not re-sent as text. Residue after a
+        completed call is dropped too (a truncated next call).
+        """
+        if self.current_tool_name_sent or not self._buffer:
+            self._buffer = ""
+            return StreamingParseResult()
+        text, self._buffer = self._buffer, ""
+        if self.current_tool_id >= 0:
+            del self.prev_tool_call_arr[self.current_tool_id :]
+            del self.streamed_args_for_tool[self.current_tool_id :]
+        self._skipping_undeclared_tool = False
+        if self.current_tool_id > 0:
+            return StreamingParseResult()
+        return StreamingParseResult(normal_text=text)
 
     def _parse_argument_pairs(
         self, pairs: List[Tuple[str, str]], func_name: str, tools: List[Tool]
@@ -966,18 +1021,3 @@ class Glm47MoeDetector(BaseFormatDetector):
 
     def get_structural_tag_name(self) -> str:
         return "glm_4_7"
-
-    def finish(self, tools: list[Tool]) -> StreamingParseResult:
-        """Release any buffered text at end of stream.
-
-        The closing marker can no longer arrive once the stream is over, so
-        flush whatever is still buffered as normal text instead of silently
-        dropping it.
-        """
-        text, self._buffer = self._buffer, ""
-        # Once a tool call has gone out (or started going out) as tool-call
-        # deltas, the residue is a truncated call; re-sending its markup as
-        # content would duplicate it, so it is dropped as before.
-        if not text or self.current_tool_name_sent or self.current_tool_id > 0:
-            return StreamingParseResult()
-        return StreamingParseResult(normal_text=text)
