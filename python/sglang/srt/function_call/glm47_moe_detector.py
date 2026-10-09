@@ -966,3 +966,18 @@ class Glm47MoeDetector(BaseFormatDetector):
 
     def get_structural_tag_name(self) -> str:
         return "glm_4_7"
+
+    def finish(self, tools: list[Tool]) -> StreamingParseResult:
+        """Release any buffered text at end of stream.
+
+        The closing marker can no longer arrive once the stream is over, so
+        flush whatever is still buffered as normal text instead of silently
+        dropping it.
+        """
+        text, self._buffer = self._buffer, ""
+        # Once a tool call has gone out (or started going out) as tool-call
+        # deltas, the residue is a truncated call; re-sending its markup as
+        # content would duplicate it, so it is dropped as before.
+        if not text or self.current_tool_name_sent or self.current_tool_id > 0:
+            return StreamingParseResult()
+        return StreamingParseResult(normal_text=text)
