@@ -1457,6 +1457,9 @@ class Envs:
     # experts a load-time 128x128 block-FP8 copy used for batches of at least this
     # many tokens (prefill); 0 keeps them BF16.
     SGLANG_OPT_BF16_LINEAR_FP8_MIN_TOKENS = EnvInt(0)
+    # A/B only: attach the glm47 full-assistant grammar to tool-free chat requests too
+    # (the pre-#39273 behaviour).
+    SGLANG_TEST_GLM47_GRAMMAR_WITHOUT_TOOLS = EnvBool(False)
 
     # ===================================================================
     # CUDA graphs and execution buffers
