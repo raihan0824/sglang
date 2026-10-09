@@ -1,9 +1,9 @@
 import json
 import logging
 import re
-from typing import List, Optional
+from typing import List, Literal, Optional, Union
 
-from sglang.srt.entrypoints.openai.protocol import Tool
+from sglang.srt.entrypoints.openai.protocol import Tool, ToolChoice
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import (
     StreamingParseResult,
@@ -402,3 +402,29 @@ class Qwen3CoderDetector(BaseFormatDetector):
 
     def get_structural_tag_name(self) -> str:
         return "qwen_3_coder"
+
+    def get_structural_tag(
+        self,
+        tools: Union[List[Tool], None] = None,
+        tool_choice: Union[ToolChoice, Literal["auto", "required"]] = "auto",
+        thinking_mode: bool = False,
+        parallel_tool_calls: bool = True,
+    ):
+        # xgrammar's qwen_xml grammar for a non-strict tool spells parameter
+        # names as identifiers only, so a declared "-i" or "a.b" cannot be
+        # written; constrain forced calls by the declared schema instead.
+        if tool_choice != "auto" and tools:
+            tools = [
+                tool.model_copy(
+                    update={
+                        "function": tool.function.model_copy(update={"strict": True})
+                    }
+                )
+                for tool in tools
+            ]
+        return super().get_structural_tag(
+            tools=tools,
+            tool_choice=tool_choice,
+            thinking_mode=thinking_mode,
+            parallel_tool_calls=parallel_tool_calls,
+        )

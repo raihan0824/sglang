@@ -247,5 +247,46 @@ class TestQwen3CoderStreamingFraming(unittest.TestCase):
         self.assertEqual((parsed[0].name, parsed[0].parameters), ("f", '{"n": 1}'))
 
 
+class TestQwen3CoderForcedCallGrammar(unittest.TestCase):
+    """Forced (required/named) calls must be able to spell every declared parameter."""
+
+    def test_required_grammar_accepts_declared_dashed_name(self):
+        try:
+            import xgrammar as xgr
+            from xgrammar.testing import _is_grammar_accept_string
+        except ImportError:
+            self.skipTest("xgrammar not installed")
+        from sglang.srt.function_call.function_call_parser import FunctionCallParser
+
+        grep = Tool(
+            type="function",
+            function=Function(
+                name="Grep",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "pattern": {"type": "string"},
+                        "-i": {"type": "boolean"},
+                    },
+                    "required": ["pattern"],
+                },
+            ),
+        )
+        parser = FunctionCallParser([grep], "qwen3_coder")
+        for choice in ("required", {"type": "function", "function": {"name": "Grep"}}):
+            if isinstance(choice, dict):
+                from sglang.srt.entrypoints.openai.protocol import ToolChoice
+
+                choice = ToolChoice(**choice)
+            kind, tag = parser.get_structure_constraint(choice)
+            self.assertEqual(kind, "structural_tag")
+            grammar = xgr.Grammar.from_structural_tag(tag)
+            call = "<tool_call>\n<function=Grep>\n<parameter=pattern>\nTODO\n</parameter>\n<parameter=-i>\ntrue\n</parameter>\n</function>\n</tool_call>"
+            self.assertTrue(_is_grammar_accept_string(grammar, call))
+            self.assertFalse(
+                _is_grammar_accept_string(grammar, call.replace("=-i>", "=i>"))
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
