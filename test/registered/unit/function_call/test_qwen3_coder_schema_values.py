@@ -186,5 +186,66 @@ class TestQwen3CoderSchemaValues(unittest.TestCase):
         self.assertIsNone(schema.convert("b", "null"))
 
 
+class TestQwen3CoderStreamingFraming(unittest.TestCase):
+    """Streamed calls must be complete JSON and match the non-streamed parse."""
+
+    tool = _tool({"n": {"type": "integer"}, "s": {"type": "string"}}, ["n"])
+
+    def _stream_calls(self, text, step):
+        detector = Qwen3CoderDetector()
+        calls, normal = {}, ""
+        for i in range(0, len(text), step):
+            result = detector.parse_streaming_increment(text[i : i + step], [self.tool])
+            normal += result.normal_text
+            for call in result.calls:
+                entry = calls.setdefault(call.tool_index, [None, ""])
+                entry[0] = call.name or entry[0]
+                entry[1] += call.parameters or ""
+        result = detector.finish([self.tool])
+        normal += result.normal_text
+        for call in result.calls:
+            calls.setdefault(call.tool_index, [None, ""])[1] += call.parameters
+        return calls, normal
+
+    def test_call_without_function_end_is_closed(self):
+        for text in (
+            "<tool_call>\n<function=f>\n<parameter=n>\n1\n</parameter>\n</tool_call>",
+            "<tool_call>\n<function=f>\n<parameter=n>\n1\n</parameter>\n",
+            "<tool_call>\n<function=f>\n<parameter=n>\n1\n",
+        ):
+            for step in (1, 5):
+                calls, _ = self._stream_calls(text, step)
+                self.assertEqual(calls, {0: ["f", '{"n": 1}']}, (text, step))
+
+    def test_stray_function_end_is_not_a_call(self):
+        """Claude-style <invoke> XML closed with </function> once streamed a nameless {} call."""
+        text = (
+            '<function_calls>\n<invoke name="f">\n<parameter name="n">1</parameter>\n'
+            "</invoke>\n</function>\n</tool_call>"
+        )
+        for step in (1, 4):
+            calls, normal = self._stream_calls(text, step)
+            self.assertEqual(calls, {})
+            self.assertIn('<invoke name="f">', normal)
+        self.assertEqual(
+            Qwen3CoderDetector().detect_and_parse(text, [self.tool]).calls, []
+        )
+
+    def test_next_function_closes_previous(self):
+        text = (
+            "<tool_call>\n<function=f>\n<parameter=n>\n1\n</parameter>\n"
+            "<function=f>\n<parameter=n>\n2\n</parameter>\n</function>\n</tool_call>"
+        )
+        calls, _ = self._stream_calls(text, 3)
+        self.assertEqual(calls, {0: ["f", '{"n": 1}'], 1: ["f", '{"n": 2}']})
+
+    def test_names_are_stripped(self):
+        text = "<tool_call>\n<function= f\n>\n<parameter= n >\n1\n</parameter>\n</function>\n</tool_call>"
+        calls, _ = self._stream_calls(text, 2)
+        self.assertEqual(calls, {0: ["f", '{"n": 1}']})
+        parsed = Qwen3CoderDetector().detect_and_parse(text, [self.tool]).calls
+        self.assertEqual((parsed[0].name, parsed[0].parameters), ("f", '{"n": 1}'))
+
+
 if __name__ == "__main__":
     unittest.main()
