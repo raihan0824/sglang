@@ -1,7 +1,7 @@
 import json
 import logging
 import re
-from typing import Any, List, Optional
+from typing import List, Optional
 
 from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
@@ -10,11 +10,7 @@ from sglang.srt.function_call.core_types import (
     ToolCallItem,
     _GetInfoFunc,
 )
-from sglang.srt.function_call.utils import (
-    get_schema_properties,
-    infer_type_from_json_schema,
-    safe_literal_eval,
-)
+from sglang.srt.function_call.param_coercion import OMIT, ToolParamSchema
 
 logger = logging.getLogger(__name__)
 
@@ -57,123 +53,19 @@ class Qwen3CoderDetector(BaseFormatDetector):
 
         # Initialize attributes that were missing in the original PR
         self.current_func_name: Optional[str] = None
+        self.current_param_schema: ToolParamSchema = ToolParamSchema(None)
 
     def has_tool_call(self, text: str) -> bool:
         return self.tool_call_start_token in text
 
-    def _get_arguments_config(
-        self, func_name: str, tools: Optional[list[Tool]]
-    ) -> dict:
-        """Extract argument configuration for a function."""
-        if tools is None:
-            return {}
-        for config in tools:
-            try:
-                config_type = config.type
-                config_function = config.function
-                config_function_name = config_function.name
-            except AttributeError:
-                continue
-
-            if config_type == "function" and config_function_name == func_name:
-                try:
-                    params = config_function.parameters
-                except AttributeError:
-                    return {}
-
-                if isinstance(params, dict):
-                    properties = get_schema_properties(params)
-                    if properties or "properties" in params:
-                        return properties
-                    return params
-                else:
-                    return {}
+    def _get_param_schema(
+        self, func_name: Optional[str], tools: Optional[list[Tool]]
+    ) -> ToolParamSchema:
+        for tool in tools or []:
+            if tool.type == "function" and tool.function.name == func_name:
+                return ToolParamSchema(tool.function.parameters)
         logger.warning(f"Tool '{func_name}' is not defined in the tools list.")
-        return {}
-
-    def _get_param_type(self, param_schema: Any) -> str:
-        """Infer the parser conversion type from a JSON schema parameter."""
-        inferred_type = infer_type_from_json_schema(param_schema)
-        if inferred_type is None:
-            return "string"
-        return str(inferred_type).strip().lower()
-
-    def _convert_param_value(
-        self, param_value: str, param_name: str, param_config: dict, func_name: str
-    ) -> Any:
-        """Convert parameter value based on its type in the schema."""
-        # Handle null value for any type
-        if param_value.lower() == "null":
-            return None
-
-        if param_name not in param_config:
-            if param_config != {}:
-                logger.warning(
-                    f"Parsed parameter '{param_name}' is not defined in the tool "
-                    f"parameters for tool '{func_name}', directly returning the string value."
-                )
-            return param_value
-
-        param_type = self._get_param_type(param_config[param_name])
-        if param_type in ["string", "str", "text", "varchar", "char", "enum"]:
-            return param_value
-        elif (
-            param_type.startswith("int")
-            or param_type.startswith("uint")
-            or param_type.startswith("long")
-            or param_type.startswith("short")
-            or param_type.startswith("unsigned")
-        ):
-            try:
-                param_value = int(param_value)
-            except Exception:
-                logger.warning(
-                    f"Parsed value '{param_value}' of parameter '{param_name}' is not an integer in tool "
-                    f"'{func_name}', degenerating to string."
-                )
-            return param_value
-        elif param_type.startswith("num") or param_type.startswith("float"):
-            try:
-                maybe_convert = (
-                    False if "." in param_value or "e" in param_value.lower() else True
-                )
-                param_value: float = float(param_value)
-                if maybe_convert and param_value.is_integer():
-                    param_value = int(param_value)
-            except Exception:
-                logger.warning(
-                    f"Parsed value '{param_value}' of parameter '{param_name}' is not a float in tool "
-                    f"'{func_name}', degenerating to string."
-                )
-            return param_value
-        elif param_type in ["boolean", "bool", "binary"]:
-            param_value = param_value.lower()
-            if param_value not in ["true", "false"]:
-                logger.warning(
-                    f"Parsed value '{param_value}' of parameter '{param_name}' is not a boolean (`true` of `false`) in tool '{func_name}', degenerating to false."
-                )
-            return param_value == "true"
-        else:
-            if (
-                param_type in ["object", "array", "arr"]
-                or param_type.startswith("dict")
-                or param_type.startswith("list")
-            ):
-                try:
-                    param_value = json.loads(param_value)
-                    return param_value
-                except Exception:
-                    logger.warning(
-                        f"Parsed value '{param_value}' of parameter '{param_name}' cannot be parsed with json.loads in tool "
-                        f"'{func_name}', will try other methods to parse it."
-                    )
-            try:
-                param_value = safe_literal_eval(param_value)
-            except Exception:
-                logger.warning(
-                    f"Parsed value '{param_value}' of parameter '{param_name}' cannot be converted via Python `ast.literal_eval()` in tool '{func_name}', degenerating to string."
-                )
-            return param_value
+        return ToolParamSchema(None)
 
     def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
         """One-shot parsing for non-streaming scenarios."""
@@ -203,7 +95,7 @@ class Qwen3CoderDetector(BaseFormatDetector):
                     func_name = func_body[:name_end]
                     params_str = func_body[name_end + 1 :]
 
-                    param_config = self._get_arguments_config(func_name, tools)
+                    param_schema = self._get_param_schema(func_name, tools)
                     parsed_params = {}
 
                     for p_match in self.tool_call_parameter_regex.findall(params_str):
@@ -218,9 +110,9 @@ class Qwen3CoderDetector(BaseFormatDetector):
                         if p_val.endswith("\n"):
                             p_val = p_val[:-1]
 
-                        parsed_params[p_name] = self._convert_param_value(
-                            p_val, p_name, param_config, func_name
-                        )
+                        value = param_schema.convert(p_name, p_val)
+                        if value is not OMIT:
+                            parsed_params[p_name] = value
 
                     calls.append(
                         ToolCallItem(
@@ -287,6 +179,7 @@ class Qwen3CoderDetector(BaseFormatDetector):
                     self.current_tool_param_count = 0
                     self.json_started = False
                     self.current_func_name = func_name
+                    self.current_param_schema = self._get_param_schema(func_name, tools)
 
                     calls.append(
                         ToolCallItem(
@@ -346,37 +239,32 @@ class Qwen3CoderDetector(BaseFormatDetector):
                         if raw_value.endswith("\n"):
                             raw_value = raw_value[:-1]
 
-                        # JSON Construction
-                        if not self.json_started:
+                        converted_val = self.current_param_schema.convert(
+                            param_name, raw_value
+                        )
+                        if converted_val is not OMIT:
+                            if not self.json_started:
+                                calls.append(
+                                    ToolCallItem(
+                                        tool_index=self.current_tool_id,
+                                        parameters="{",
+                                    )
+                                )
+                                self.json_started = True
+
+                            json_key_val = f"{json.dumps(param_name)}: {json.dumps(converted_val, ensure_ascii=False)}"
+                            if self.current_tool_param_count > 0:
+                                fragment = f", {json_key_val}"
+                            else:
+                                fragment = json_key_val
+
                             calls.append(
                                 ToolCallItem(
-                                    tool_index=self.current_tool_id, parameters="{"
+                                    tool_index=self.current_tool_id,
+                                    parameters=fragment,
                                 )
                             )
-                            self.json_started = True
-
-                        param_config = self._get_arguments_config(
-                            self.current_func_name, tools
-                        )
-                        converted_val = self._convert_param_value(
-                            raw_value, param_name, param_config, self.current_func_name
-                        )
-
-                        # Construct JSON fragment: "key": value
-                        # Note: We must be careful with json.dumps to ensure valid JSON streaming
-                        json_key_val = f"{json.dumps(param_name)}: {json.dumps(converted_val, ensure_ascii=False)}"
-
-                        if self.current_tool_param_count > 0:
-                            fragment = f", {json_key_val}"
-                        else:
-                            fragment = json_key_val
-
-                        calls.append(
-                            ToolCallItem(
-                                tool_index=self.current_tool_id, parameters=fragment
-                            )
-                        )
-                        self.current_tool_param_count += 1
+                            self.current_tool_param_count += 1
 
                         # Advance cursor
                         total_len = (name_end + 1) + end_pos + end_token_len
