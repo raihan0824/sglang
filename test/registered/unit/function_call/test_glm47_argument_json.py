@@ -76,5 +76,54 @@ class TestGlm47ArgumentJson(unittest.TestCase):
         self.assertEqual(args, {"x": "NaN", "y": "Infinity"})
 
 
+class TestGlm47ConformanceLog(unittest.TestCase):
+    """Calls that would fail OpenRouter's checks are logged with where, not what."""
+
+    tool = Tool(
+        type="function",
+        function=Function(
+            name="f",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "n": {"type": "integer", "maximum": 10},
+                    "s": {"type": "string"},
+                },
+                "required": ["n", "s"],
+            },
+        ),
+    )
+
+    def test_schema_mismatch_is_logged_without_values(self):
+        text = _call(n="7200")
+        with self.assertLogs(
+            "sglang.srt.function_call.glm47_moe_detector", "WARNING"
+        ) as logs:
+            Glm47MoeDetector().detect_and_parse(text, [self.tool])
+            _stream_args([self.tool], text, 3)
+        joined = "\n".join(logs.output)
+        self.assertIn("tool=f mode=nonstream", joined)
+        self.assertIn("tool=f mode=stream", joined)
+        self.assertIn("$.n maximum=10", joined)
+        self.assertIn("'s' is a required property", joined)
+        self.assertNotIn("7200", joined)
+
+    def test_truncated_stream_is_logged(self):
+        with self.assertLogs(
+            "sglang.srt.function_call.glm47_moe_detector", "WARNING"
+        ) as logs:
+            _stream_args(
+                [self.tool], "<tool_call>f<arg_key>s</arg_key><arg_value>abc", 4
+            )
+        self.assertIn("stream ended inside a tool call: tool=f", "\n".join(logs.output))
+
+    def test_conforming_call_logs_nothing(self):
+        detector = Glm47MoeDetector()
+        with self.assertNoLogs(
+            "sglang.srt.function_call.glm47_moe_detector", "WARNING"
+        ):
+            detector.detect_and_parse(_call(n="3", s="x"), [self.tool])
+
+
 if __name__ == "__main__":
     unittest.main()

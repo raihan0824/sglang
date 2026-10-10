@@ -17,6 +17,7 @@ from sglang.srt.function_call.core_types import (
     ToolCallItem,
     _GetInfoFunc,
 )
+from sglang.srt.function_call.glm4_moe_detector import _glm_has_complete_properties
 from sglang.srt.function_call.utils import safe_literal_eval
 
 logger = logging.getLogger(__name__)
@@ -247,6 +248,56 @@ def _coerce_numeric_string(value: Any, arg_type: Optional[str]) -> Any:
     return value
 
 
+def _describe_schema_error(error) -> str:
+    path = "$" + "".join(
+        f"[{p}]" if isinstance(p, int) else f".{p}" for p in error.absolute_path
+    )
+    # Key names only: the messages of these validators carry no argument values.
+    if error.validator in ("required", "additionalProperties"):
+        return f"{path} {error.message[:200]}"
+    expected = json.dumps(error.validator_value, ensure_ascii=False, default=str)
+    return f"{path} {error.validator}={expected[:120]}"
+
+
+def log_call_conformance(
+    func_name: str, arguments: str, tools: List[Tool], mode: str
+) -> None:
+    """Warn when a parsed call would fail OpenRouter's tool-call checks.
+
+    Logs where the call breaks its schema, never the argument values.
+    """
+    try:
+        args = _strict_json_loads(arguments)
+    except (ValueError, TypeError):
+        logger.warning(
+            "glm47 tool call arguments are not valid JSON: tool=%s mode=%s chars=%d",
+            func_name,
+            mode,
+            len(arguments),
+        )
+        return
+    try:
+        from jsonschema import Draft202012Validator
+
+        params = next(
+            (t.function.parameters for t in tools if t.function.name == func_name),
+            None,
+        )
+        if not isinstance(params, dict) or not isinstance(args, dict):
+            return
+        errors = list(Draft202012Validator(params).iter_errors(args))
+    except Exception:
+        return
+    if errors:
+        logger.warning(
+            "glm47 tool call fails its schema: tool=%s mode=%s grammar_typed=%s errors=%s",
+            func_name,
+            mode,
+            _glm_has_complete_properties(params),
+            "; ".join(_describe_schema_error(e) for e in errors[:5]),
+        )
+
+
 def _reject_constant(name: str) -> Any:
     raise ValueError(f"{name} is not JSON")
 
@@ -460,7 +511,10 @@ class Glm47MoeDetector(BaseFormatDetector):
 
                 # construct match_result for parse_base_json
                 match_result = {"name": func_name, "parameters": arguments}
-                calls.extend(self.parse_base_json(match_result, tools))
+                parsed_calls = self.parse_base_json(match_result, tools)
+                for call in parsed_calls:
+                    log_call_conformance(call.name, call.parameters, tools, "nonstream")
+                calls.extend(parsed_calls)
             return StreamingParseResult(normal_text=normal_text, calls=calls)
         except Exception as e:
             logger.error(f"Error in detect_and_parse: {e}", exc_info=True)
@@ -783,6 +837,12 @@ class Glm47MoeDetector(BaseFormatDetector):
             except Exception as e:
                 logger.debug(f"Failed to parse arguments: {e}", exc_info=True)
 
+        log_call_conformance(
+            func_name,
+            self.streamed_args_for_tool[self.current_tool_id],
+            tools,
+            "stream",
+        )
         self._buffer = current_text[match_end_pos:]
 
         # Reset state for next tool call
@@ -964,6 +1024,14 @@ class Glm47MoeDetector(BaseFormatDetector):
         out as tool-call deltas and is not re-sent as text. Residue after a
         completed call is dropped too (a truncated next call).
         """
+        if self.current_tool_name_sent and 0 <= self.current_tool_id < len(
+            self.streamed_args_for_tool
+        ):
+            logger.warning(
+                "glm47 stream ended inside a tool call: tool=%s streamed_chars=%d",
+                (self.prev_tool_call_arr[self.current_tool_id] or {}).get("name"),
+                len(self.streamed_args_for_tool[self.current_tool_id]),
+            )
         if self.current_tool_name_sent or not self._buffer:
             self._buffer = ""
             return StreamingParseResult()
