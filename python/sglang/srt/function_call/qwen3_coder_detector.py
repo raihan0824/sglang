@@ -5,6 +5,7 @@ from typing import List, Literal, Optional, Union
 
 from sglang.srt.entrypoints.openai.protocol import Tool, ToolChoice
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
+from sglang.srt.function_call.call_conformance import log_call_conformance
 from sglang.srt.function_call.core_types import (
     StreamingParseResult,
     ToolCallItem,
@@ -13,6 +14,9 @@ from sglang.srt.function_call.core_types import (
 from sglang.srt.function_call.param_coercion import OMIT, ToolParamSchema
 
 logger = logging.getLogger(__name__)
+
+# Stable grep prefix for the per-call conformance warnings.
+LOG_PREFIX = "qwen3_coder tool call"
 
 
 class Qwen3CoderDetector(BaseFormatDetector):
@@ -54,6 +58,10 @@ class Qwen3CoderDetector(BaseFormatDetector):
         # Initialize attributes that were missing in the original PR
         self.current_func_name: Optional[str] = None
         self.current_param_schema: ToolParamSchema = ToolParamSchema(None)
+        # Arguments streamed for the open call and the request's tools, for the
+        # conformance check when the call closes.
+        self._streamed_args: str = ""
+        self._tools: Optional[List[Tool]] = None
 
     def has_tool_call(self, text: str) -> bool:
         return self.tool_call_start_token in text
@@ -124,11 +132,13 @@ class Qwen3CoderDetector(BaseFormatDetector):
                         if value is not OMIT:
                             parsed_params[p_name] = value
 
+                    arguments = json.dumps(parsed_params, ensure_ascii=False)
+                    log_call_conformance(
+                        LOG_PREFIX, func_name, arguments, tools, "nonstream"
+                    )
                     calls.append(
                         ToolCallItem(
-                            tool_index=tool_idx,
-                            name=func_name,
-                            parameters=json.dumps(parsed_params, ensure_ascii=False),
+                            tool_index=tool_idx, name=func_name, parameters=arguments
                         )
                     )
                     tool_idx += 1
@@ -152,6 +162,7 @@ class Qwen3CoderDetector(BaseFormatDetector):
         Robust cursor-based streaming parser.
         """
         self._buffer += new_text
+        self._tools = tools
 
         # Guard against empty buffer
         if not self._buffer:
@@ -192,6 +203,7 @@ class Qwen3CoderDetector(BaseFormatDetector):
                     self.current_tool_param_count = 0
                     self.json_started = False
                     self.current_func_name = func_name
+                    self._streamed_args = ""
                     self.current_param_schema = self._get_param_schema(func_name, tools)
 
                     calls.append(
@@ -357,6 +369,7 @@ class Qwen3CoderDetector(BaseFormatDetector):
             return
         if not self.json_started:
             calls.append(ToolCallItem(tool_index=self.current_tool_id, parameters="{"))
+            self._streamed_args += "{"
             self.json_started = True
         json_key_val = (
             f"{json.dumps(param_name)}: {json.dumps(converted_val, ensure_ascii=False)}"
@@ -366,16 +379,22 @@ class Qwen3CoderDetector(BaseFormatDetector):
         calls.append(
             ToolCallItem(tool_index=self.current_tool_id, parameters=json_key_val)
         )
+        self._streamed_args += json_key_val
         self.current_tool_param_count += 1
 
-    def _close_open_function(self, calls: list) -> None:
+    def _close_open_function(self, calls: list, mode: str = "stream") -> None:
         """Emit the closing brace of the function being streamed, if any."""
         if self.current_func_name is None:
             return
         if not self.json_started:
             calls.append(ToolCallItem(tool_index=self.current_tool_id, parameters="{"))
+            self._streamed_args += "{"
             self.json_started = True
         calls.append(ToolCallItem(tool_index=self.current_tool_id, parameters="}"))
+        self._streamed_args += "}"
+        log_call_conformance(
+            LOG_PREFIX, self.current_func_name, self._streamed_args, self._tools, mode
+        )
         self.current_func_name = None
 
     def finish(self, tools: List[Tool]) -> StreamingParseResult:
@@ -383,12 +402,13 @@ class Qwen3CoderDetector(BaseFormatDetector):
         calls = []
         rest = self._buffer[self.parsed_pos :]
         self._buffer, self.parsed_pos = "", 0
+        self._tools = tools
         if self.current_func_name is not None:
             if rest.startswith(self.parameter_prefix) and ">" in rest:
                 name_end = rest.index(">")
                 param_name = rest[len(self.parameter_prefix) : name_end].strip()
                 self._emit_param(calls, param_name, rest[name_end + 1 :])
-            self._close_open_function(calls)
+            self._close_open_function(calls, mode="stream-eos")
             return StreamingParseResult(calls=calls)
         if self.is_inside_tool_call:
             return StreamingParseResult()

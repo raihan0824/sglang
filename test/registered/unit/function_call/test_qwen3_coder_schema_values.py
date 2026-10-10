@@ -288,5 +288,72 @@ class TestQwen3CoderForcedCallGrammar(unittest.TestCase):
             )
 
 
+class TestQwen3CoderConformanceLog(unittest.TestCase):
+    """Calls that would fail OpenRouter's checks log where they break, never values."""
+
+    LOGGER = "sglang.srt.function_call.call_conformance"
+    tool = _tool(
+        {
+            "command": {"type": "array", "items": {"type": "string"}},
+            "timeout": {"type": "integer", "maximum": 3600},
+        },
+        ["command"],
+        additionalProperties=False,
+    )
+
+    def _stream(self, text, step=3):
+        detector = Qwen3CoderDetector()
+        for i in range(0, len(text), step):
+            detector.parse_streaming_increment(text[i : i + step], [self.tool])
+        detector.finish([self.tool])
+
+    def test_schema_mismatch_logged_without_values(self):
+        text = _call(command="cat /secret/path.txt", timeout="7200", extra="v")
+        with self.assertLogs(self.LOGGER, "WARNING") as logs:
+            Qwen3CoderDetector().detect_and_parse(text, [self.tool])
+            self._stream(text)
+        joined = "\n".join(logs.output)
+        self.assertEqual(
+            joined.count("qwen3_coder tool call fails its schema: tool=f"), 2
+        )
+        self.assertIn("mode=nonstream", joined)
+        self.assertIn("mode=stream ", joined)
+        self.assertIn('$.command type="array" got=string', joined)
+        self.assertIn("$.timeout maximum=3600 got=integer", joined)
+        self.assertIn("'extra' was unexpected", joined)
+        self.assertNotIn("secret", joined)
+        self.assertNotIn("7200", joined)
+
+    def test_unknown_name_and_truncated_stream(self):
+        with self.assertLogs(self.LOGGER, "WARNING") as logs:
+            Qwen3CoderDetector().detect_and_parse(
+                _call(command='["ls"]').replace("=f>", "=g>"), [self.tool]
+            )
+            self._stream("<tool_call>\n<function=f>\n<parameter=timeout>\n5\n")
+        joined = "\n".join(logs.output)
+        self.assertIn(
+            "qwen3_coder tool call name not in tools: name='g' mode=nonstream", joined
+        )
+        self.assertIn("mode=stream-eos", joined)
+        self.assertIn("'command' is a required property", joined)
+
+    def test_conforming_call_logs_nothing(self):
+        text = _call(command='["ls", "-la"]', timeout="5")
+        with self.assertNoLogs(self.LOGGER, "WARNING"):
+            Qwen3CoderDetector().detect_and_parse(text, [self.tool])
+            self._stream(text)
+
+    def test_broken_schema_never_raises(self):
+        bad = Tool(
+            type="function",
+            function=Function(
+                name="f",
+                parameters={"type": "object", "properties": {"x": {"type": 5}}},
+            ),
+        )
+        result = Qwen3CoderDetector().detect_and_parse(_call(x="1"), [bad])
+        self.assertEqual(len(result.calls), 1)
+
+
 if __name__ == "__main__":
     unittest.main()
