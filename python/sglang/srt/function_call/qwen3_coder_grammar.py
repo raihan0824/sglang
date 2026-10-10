@@ -55,17 +55,10 @@ def _loose_schema(root: Dict[str, Any], schema: Any, depth: int = 0) -> Dict[str
         branches = resolved.get(keyword)
         if isinstance(branches, list):
             out[keyword] = [_loose_schema(root, b, depth + 1) for b in branches]
-    for keyword in (
-        "type",
-        "enum",
-        "const",
-        "minimum",
-        "maximum",
-        "exclusiveMinimum",
-        "exclusiveMaximum",
-        "minItems",
-        "maxItems",
-    ):
+    # Types and enums only: a digit-by-digit range or an item-count limit cuts a
+    # value short (7200 above maximum 3600 decoded as 720), changing what the
+    # model meant; out-of-range values stay visible as schema errors instead.
+    for keyword in ("type", "enum", "const"):
         if keyword in resolved:
             out[keyword] = resolved[keyword]
     if "type" not in out and (

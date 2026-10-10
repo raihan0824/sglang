@@ -421,11 +421,12 @@ class TestQwen3CoderAutoGrammar(unittest.TestCase):
         )
         self.assertTrue(self.ok("no tool call at all"))
 
+    def test_out_of_range_number_is_not_cut_short(self):
+        """A maximum enforced digit by digit decoded an intended 7200 as 720."""
+        self.assertTrue(self.ok(_call(command='["ls"]', timeout="7200")))
+
     def test_schema_violations_are_rejected(self):
         self.assertFalse(self.ok(_call(command="cat /x")))  # string for array
-        self.assertFalse(
-            self.ok(_call(command='["ls"]', timeout="7200"))
-        )  # above maximum
         self.assertFalse(
             self.ok(_call(command='["ls"]', timeout="1.5"))
         )  # not an integer
