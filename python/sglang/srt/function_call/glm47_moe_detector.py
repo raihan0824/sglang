@@ -21,8 +21,6 @@ from sglang.srt.function_call.utils import safe_literal_eval
 
 logger = logging.getLogger(__name__)
 
-_JSON_OPENERS = {"array": "[", "object": "{"}
-
 
 @lru_cache(maxsize=1)
 def _glm47_native_structural_tag_available() -> bool:
@@ -249,6 +247,16 @@ def _coerce_numeric_string(value: Any, arg_type: Optional[str]) -> Any:
     return value
 
 
+def _reject_constant(name: str) -> Any:
+    raise ValueError(f"{name} is not JSON")
+
+
+def _strict_json_loads(text: str) -> Any:
+    # json.loads accepts NaN/Infinity, which json.dumps then emits as bare
+    # non-JSON tokens in the tool-call arguments.
+    return json.loads(text, parse_constant=_reject_constant)
+
+
 def parse_arguments(
     json_value: str, arg_type: Optional[str] = None
 ) -> Tuple[Any, bool]:
@@ -263,14 +271,17 @@ def parse_arguments(
     """
     # Strategy 1: Direct JSON parsing
     try:
-        return _coerce_numeric_string(json.loads(json_value), arg_type), True
+        return _coerce_numeric_string(_strict_json_loads(json_value), arg_type), True
     except (json.JSONDecodeError, ValueError):
         pass
 
     # Strategy 2: Unescape and parse
     try:
         wrapped = json.loads('{"tmp": "' + json_value + '"}')
-        return _coerce_numeric_string(json.loads(wrapped["tmp"]), arg_type), True
+        return (
+            _coerce_numeric_string(_strict_json_loads(wrapped["tmp"]), arg_type),
+            True,
+        )
     except (json.JSONDecodeError, ValueError, KeyError):
         pass
 
@@ -571,19 +582,12 @@ class Glm47MoeDetector(BaseFormatDetector):
                                 self._current_value += content
                                 self._xml_tag_buffer = ""
                         else:
-                            # Object/array values that open as JSON stream through
-                            # verbatim; anything else ("1, 2", "True") is held and
-                            # parsed at value close, as non-streaming does.
+                            # Object/array values are held and parsed at value
+                            # close, as non-streaming does: text that opens like
+                            # JSON can still be Python-style or end in a comma.
                             if content:
                                 self._current_value += content
                                 self._xml_tag_buffer = ""
-                                if self._value_started:
-                                    json_output += content
-                                elif self._current_value.lstrip()[
-                                    :1
-                                ] == _JSON_OPENERS.get(value_type):
-                                    self._value_started = True
-                                    json_output += self._current_value
 
         return json_output
 
@@ -773,9 +777,9 @@ class Glm47MoeDetector(BaseFormatDetector):
                 pairs = find_arg_pairs(func_args_raw)
                 if pairs:
                     arguments = self._parse_argument_pairs(pairs, func_name, tools)
-                    self.prev_tool_call_arr[self.current_tool_id]["arguments"] = (
-                        arguments
-                    )
+                    self.prev_tool_call_arr[self.current_tool_id][
+                        "arguments"
+                    ] = arguments
             except Exception as e:
                 logger.debug(f"Failed to parse arguments: {e}", exc_info=True)
 
