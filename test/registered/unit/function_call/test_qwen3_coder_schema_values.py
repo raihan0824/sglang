@@ -355,5 +355,89 @@ class TestQwen3CoderConformanceLog(unittest.TestCase):
         self.assertEqual(len(result.calls), 1)
 
 
+class TestQwen3CoderAutoGrammar(unittest.TestCase):
+    """tool_choice=auto constrains calls to declared names and typed values in any order."""
+
+    @classmethod
+    def setUpClass(cls):
+        try:
+            import xgrammar as xgr
+            from xgrammar.testing import _is_grammar_accept_string
+        except ImportError:
+            raise unittest.SkipTest("xgrammar not installed")
+        from sglang.srt.function_call.function_call_parser import FunctionCallParser
+
+        cls.accepts = staticmethod(_is_grammar_accept_string)
+        tools = [
+            _tool(
+                {
+                    "command": {"type": "array", "items": {"type": "string"}},
+                    "timeout": {"type": "integer", "maximum": 3600},
+                    "background": {"type": "boolean"},
+                    "mode": {"type": "string", "enum": ["fast", "safe"]},
+                    "note": {"type": ["string", "null"]},
+                    "todos": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "content": {"type": "string"},
+                                "status": {"type": "string"},
+                            },
+                        },
+                    },
+                },
+                ["command"],
+            ),
+            Tool(
+                type="function",
+                function=Function(
+                    name="noargs", parameters={"type": "object", "properties": {}}
+                ),
+            ),
+        ]
+        kind, tag = FunctionCallParser(tools, "qwen3_coder").get_structure_constraint(
+            "auto"
+        )
+        assert kind == "structural_tag"
+        cls.grammar = xgr.Grammar.from_structural_tag(tag)
+
+    def ok(self, text):
+        return self.accepts(self.grammar, text)
+
+    def test_valid_calls_in_any_order_are_accepted(self):
+        call = _call(
+            timeout="60",
+            background="True",
+            command='["ls", "-la"]',
+            todos='[{"status": "pending", "content": "x"}]',
+            mode="safe",
+            note="null",
+        )
+        self.assertTrue(self.ok("Let me look.\n\n" + call))
+        self.assertTrue(self.ok(call + "\n" + _call(command='["pwd"]')))
+        self.assertTrue(
+            self.ok("<tool_call>\n<function=noargs>\n</function>\n</tool_call>")
+        )
+        self.assertTrue(self.ok("no tool call at all"))
+
+    def test_schema_violations_are_rejected(self):
+        self.assertFalse(self.ok(_call(command="cat /x")))  # string for array
+        self.assertFalse(
+            self.ok(_call(command='["ls"]', timeout="7200"))
+        )  # above maximum
+        self.assertFalse(
+            self.ok(_call(command='["ls"]', timeout="1.5"))
+        )  # not an integer
+        self.assertFalse(self.ok(_call(command='["ls"]', mode="slow")))  # not in enum
+        self.assertFalse(
+            self.ok(_call(command='["ls"]', extra="1"))
+        )  # undeclared parameter
+        self.assertFalse(self.ok(_call(timeout="5")))  # required parameter missing
+        self.assertFalse(
+            self.ok(_call(command='["ls"]').replace("=f>", "=g>"))
+        )  # undeclared tool
+
+
 if __name__ == "__main__":
     unittest.main()

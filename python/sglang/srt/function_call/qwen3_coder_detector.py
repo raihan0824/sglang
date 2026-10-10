@@ -12,6 +12,7 @@ from sglang.srt.function_call.core_types import (
     _GetInfoFunc,
 )
 from sglang.srt.function_call.param_coercion import OMIT, ToolParamSchema
+from sglang.srt.function_call.qwen3_coder_grammar import build_auto_tool_call_tag
 
 logger = logging.getLogger(__name__)
 
@@ -422,6 +423,16 @@ class Qwen3CoderDetector(BaseFormatDetector):
 
     def get_structural_tag_name(self) -> str:
         return "qwen_3_coder"
+
+    def get_auto_tool_call_structural_tag(
+        self,
+        tools: Union[List[Tool], None] = None,
+        thinking_mode: bool = False,
+        parallel_tool_calls: bool = True,
+    ):
+        return build_auto_tool_call_tag(
+            tools, thinking_mode=thinking_mode, parallel_tool_calls=parallel_tool_calls
+        )
 
     def get_structural_tag(
         self,
