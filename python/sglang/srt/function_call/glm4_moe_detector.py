@@ -1,4 +1,5 @@
 import hashlib
+import itertools
 import json
 import logging
 import re
@@ -9,6 +10,7 @@ from functools import lru_cache
 from typing import Any, Dict, List, Literal, Optional, Set, Tuple
 
 from sglang.srt.entrypoints.openai.protocol import Tool
+from sglang.srt.function_call.glm_value_rules import GlmValueRules, tool_properties
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import (
     StreamingParseResult,
@@ -575,9 +577,9 @@ class Glm4MoeDetector(BaseFormatDetector):
                                 )
                             )
                             self._last_arguments += json_increment
-                            self.streamed_args_for_tool[self.current_tool_id] += (
-                                json_increment
-                            )
+                            self.streamed_args_for_tool[
+                                self.current_tool_id
+                            ] += json_increment
 
                     if is_tool_end == self.eot_token:
                         if self._is_first_param:
@@ -590,9 +592,9 @@ class Glm4MoeDetector(BaseFormatDetector):
                                 )
                             )
                             self._last_arguments += empty_object
-                            self.streamed_args_for_tool[self.current_tool_id] += (
-                                empty_object
-                            )
+                            self.streamed_args_for_tool[
+                                self.current_tool_id
+                            ] += empty_object
                         else:
                             # The streamed outer `{` is only closed here; a
                             # trailing "}" may belong to a nested object value.
@@ -605,9 +607,9 @@ class Glm4MoeDetector(BaseFormatDetector):
                                 )
                             )
                             self._last_arguments += closing_brace
-                            self.streamed_args_for_tool[self.current_tool_id] += (
-                                closing_brace
-                            )
+                            self.streamed_args_for_tool[
+                                self.current_tool_id
+                            ] += closing_brace
 
                         try:
                             pairs = self.func_arg_regex.findall(func_args_raw)
@@ -885,91 +887,17 @@ _GLM_XML_GRAMMAR_RULES = [
     'basic_null ::= "null"',
 ]
 
-_GLM_TYPE_MAPPING = {
-    "string": "text_without_special_tokens",
-    "number": "basic_number",
-    "integer": "basic_number",
-    "boolean": "basic_boolean",
-    "null": "basic_null",
-    "array": "basic_array",
-    "object": "basic_object",
-}
+# Required arguments are enforced in any order by one alternative per
+# permutation; arbitrary cap to keep the grammar small (3! = 6 alternatives).
+_GLM_MAX_ENFORCED_REQUIRED = 3
 
 
 def _glm_hash_name(name: str) -> str:
     return hashlib.sha256(name.encode("utf-8")).hexdigest()[:16]
 
 
-def _glm_get_value_rule(prop: Any) -> str:
-    if not isinstance(prop, dict):
-        return "text_without_special_tokens"
-    if "enum" in prop:
-        return _glm_handle_enum(prop)
-    if "type" in prop:
-        return _glm_handle_type(prop)
-    return "text_without_special_tokens"
-
-
 def _glm_escape_ebnf_string(s: str) -> str:
     return json.dumps(s, ensure_ascii=False)[1:-1]
-
-
-def _glm_handle_enum(prop: dict) -> str:
-    enum_values = prop["enum"]
-
-    def format_enum_val(v: Any) -> str:
-        value = v if isinstance(v, str) else json.dumps(v, ensure_ascii=False)
-        return f'"{_glm_escape_ebnf_string(value)}"'
-
-    formatted_values = [format_enum_val(v) for v in enum_values]
-    if not formatted_values:
-        return "text_without_special_tokens"
-    enum_rule = " | ".join(formatted_values)
-    return f"({enum_rule})" if len(formatted_values) > 1 else enum_rule
-
-
-def _glm_handle_type(prop: dict) -> str:
-    prop_type = prop["type"]
-    if isinstance(prop_type, list):
-        type_rules = [
-            _GLM_TYPE_MAPPING.get(t, "text_without_special_tokens") for t in prop_type
-        ]
-        return " | ".join(type_rules) if type_rules else "text_without_special_tokens"
-    return _GLM_TYPE_MAPPING.get(prop_type, "text_without_special_tokens")
-
-
-def _glm_has_complete_properties(schema: Any) -> bool:
-    if not isinstance(schema, dict):
-        return schema is False
-    if any(
-        keyword in schema
-        for keyword in (
-            "$ref",
-            "$dynamicRef",
-            "patternProperties",
-            "dependentSchemas",
-            "if",
-            "then",
-            "else",
-        )
-    ) or any(
-        schema.get(keyword, False) is not False
-        for keyword in ("additionalProperties", "unevaluatedProperties")
-    ):
-        return False
-    branches = [
-        branch
-        for keyword in ("allOf", "anyOf", "oneOf")
-        for branch in schema.get(keyword, [])
-    ]
-    properties = schema.get("properties")
-    if isinstance(properties, dict):
-        return not branches and (
-            bool(properties) or schema.get("additionalProperties") is False
-        )
-    if branches:
-        return all(_glm_has_complete_properties(branch) for branch in branches)
-    return schema.get("additionalProperties") is False
 
 
 def _glm_build_tool_call_rules(
@@ -1009,47 +937,65 @@ def _glm_build_tool_call_rules(
     kv_template = f'"{special_tokens.begin_of_key}{{key}}{special_tokens.end_of_key}" {extra_seperator} "{special_tokens.begin_of_value}" ({{valrule}}) "{special_tokens.end_of_value}"'
     kv_separator = extra_seperator
 
+    free_pair = (
+        f'"{special_tokens.begin_of_key}" text_without_special_tokens '
+        f'"{special_tokens.end_of_key}" {extra_seperator} '
+        f'"{special_tokens.begin_of_value}" text_without_special_tokens '
+        f'"{special_tokens.end_of_value}"'
+    )
+
     for function_index, func in enumerate(functions):
         tool_name = _glm_escape_ebnf_string(func.name)
         namehash = _glm_hash_name(func.name + str(function_index))
         params = func.parameters or {}
-        properties = get_schema_properties(params)
-        if not _glm_has_complete_properties(params):
-            properties = {}
+        properties, required, extra_allowed = tool_properties(params)
+        values = GlmValueRules(params, f"v_{namehash}")
 
-        prop_kv_pairs = {}
-
-        for prop_name, prop_schema in properties.items():
-            # Composition branches can disagree on a property's value schema.
-            value_rule = (
-                "text_without_special_tokens"
-                if any(keyword in params for keyword in ("allOf", "anyOf", "oneOf"))
-                else _glm_get_value_rule(prop_schema)
-            )
+        pair_rules = {}
+        for prop_index, (prop_name, prop_schema) in enumerate(properties.items()):
             pair = kv_template.format(
-                key=_glm_escape_ebnf_string(prop_name), valrule=value_rule
+                key=_glm_escape_ebnf_string(prop_name),
+                valrule=values.top(prop_schema),
             )
-            prop_kv_pairs[prop_name] = pair
+            pair_rules[prop_name] = f"kv_{namehash}_{prop_index}"
+            rules.append(f"{pair_rules[prop_name]} ::= {pair}")
+        rules.extend(values.rules)
 
         # Non-strict arguments may be omitted, repeated, or emitted in any order.
-        all_props = list(properties.keys())
-
-        if all_props:
-            all_choices = " | ".join(prop_kv_pairs[k] for k in all_props)
+        choices = list(pair_rules.values()) + ([free_pair] if extra_allowed else [])
+        enforce_required = (
+            chat_template_version == "glm47"
+            and required
+            and len(required) <= _GLM_MAX_ENFORCED_REQUIRED
+        )
+        if not choices:
+            arguments_rule = f"( {free_pair} {kv_separator} )*"
+        elif enforce_required:
+            # glm47 has no separator, so "any arguments" is a plain repetition.
+            any_args = f"args_{namehash}"
+            rules.append(f"{any_args} ::= ( {' | '.join(choices)} )*")
+            orders = []
+            for order in itertools.permutations(required):
+                orders.append(
+                    " ".join(
+                        [any_args] + [f"{pair_rules[k]} {any_args}" for k in order]
+                    )
+                )
+            arguments_rule = " | ".join(f"( {o} )" for o in orders)
+        else:
+            all_choices = " | ".join(choices)
             arguments_rule = (
                 f"( ( {all_choices} ) ( {kv_separator} ( {all_choices} ) )* )?"
             )
-        else:
-            arguments_rule = (
-                f'( "{special_tokens.begin_of_key}" text_without_special_tokens '
-                f'"{special_tokens.end_of_key}" {extra_seperator} '
-                f'"{special_tokens.begin_of_value}" text_without_special_tokens '
-                f'"{special_tokens.end_of_value}" {kv_separator} )*'
-            )
 
-        rules.append(
-            f'call_{namehash} ::= "{tool_name}" {extra_seperator} ( arguments_{namehash} {extra_seperator} )?'
-        )
+        if enforce_required:
+            rules.append(
+                f'call_{namehash} ::= "{tool_name}" {extra_seperator} arguments_{namehash} {extra_seperator}'
+            )
+        else:
+            rules.append(
+                f'call_{namehash} ::= "{tool_name}" {extra_seperator} ( arguments_{namehash} {extra_seperator} )?'
+            )
         rules.append(f"arguments_{namehash} ::= {arguments_rule}")
 
     rules.extend(_GLM_XML_GRAMMAR_RULES)
@@ -1084,9 +1030,11 @@ def generate_glm_grammar(
     parallel_tool_calls: bool = True,
 ) -> str:
     ebnf_lines = [
-        f'{root_name} ::= assistant_turn ( "{special_tokens.assistant_token}" assistant_turn )*'
-        if allow_multiple_assistant_turns
-        else f"{root_name} ::= assistant_turn",
+        (
+            f'{root_name} ::= assistant_turn ( "{special_tokens.assistant_token}" assistant_turn )*'
+            if allow_multiple_assistant_turns
+            else f"{root_name} ::= assistant_turn"
+        ),
         "assistant_turn ::= thinking_block "
         + ("" if required and functions else "text_block ")
         + "tool_call_blocks",

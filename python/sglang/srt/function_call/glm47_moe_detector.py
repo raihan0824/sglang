@@ -17,7 +17,7 @@ from sglang.srt.function_call.core_types import (
     ToolCallItem,
     _GetInfoFunc,
 )
-from sglang.srt.function_call.glm4_moe_detector import _glm_has_complete_properties
+from sglang.srt.function_call.glm_value_rules import tool_properties
 from sglang.srt.function_call.utils import safe_literal_eval
 
 logger = logging.getLogger(__name__)
@@ -293,7 +293,7 @@ def log_call_conformance(
             "glm47 tool call fails its schema: tool=%s mode=%s grammar_typed=%s errors=%s",
             func_name,
             mode,
-            _glm_has_complete_properties(params),
+            bool(tool_properties(params)[0]),
             "; ".join(_describe_schema_error(e) for e in errors[:5]),
         )
 
